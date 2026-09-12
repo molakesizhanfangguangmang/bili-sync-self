@@ -85,6 +85,8 @@
 
 `build.sh` 把 `web/index.html` 嵌成 C 字符串，再和 `vendor/sqlite3.c` 一起静态链接。`sqlite3.c` 单独编且有缓存（RK3566 上 `-O1` 约两分钟），之后改前端或改 `steward.c` 是秒级重编。跨架构就 `CC=aarch64-linux-gnu-gcc ./build.sh`。
 
+不想自己编：去 [Releases](../../releases) 下 `steward-v1.0.0-aarch64`，放到 `dist/steward`（`install.sh` 认这个位置），然后直接跑安装。
+
 ## 安装
 
 需要 docker 权限（在能跑 docker 的账号下执行）：

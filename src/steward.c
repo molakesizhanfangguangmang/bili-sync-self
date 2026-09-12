@@ -532,6 +532,16 @@ static int  g_watch_pushed    = 0;      /* 累计推过几条「下载完成」 
 static int  g_watch_lost      = 0;      /* 累计推过几条「文件不在了」 */
 static long long g_watch_last = 0;
 
+/* 网速：容器自己的 netns 里读 /proc/net/dev（下载流量就是这里的收包）。
+ * 单独一个 2 秒的采样线程，页面也是 2 秒来问一次 /api/net。 */
+static long long g_net_rx = 0, g_net_tx = 0;          /* 累计字节 */
+static long long g_net_rx_rate = 0, g_net_tx_rate = 0;/* 字节/秒 */
+static long long g_net_ts = 0;                        /* 上次采样时刻 */
+static char g_net_iface[64] = "";
+
+/* 首页板块配置，落在 data.sqlite 同目录的 steward-prefs.json 里（bind mount，重建容器不丢） */
+static char g_prefs_path[PATH_MAX] = "";
+
 static void human_size(long long n, char *out, size_t outlen)
 {
     static const char *u[] = { "B", "KiB", "MiB", "GiB", "TiB" };
@@ -1056,6 +1066,217 @@ static void *disk_thread(void *arg)
         sleep((unsigned)g_check_every);
     }
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* 网速                                                                */
+/* ------------------------------------------------------------------ */
+
+/* 读 /proc/net/dev，把非环回、非虚拟口加起来。容器里通常只有一个 eth0。 */
+static int net_read(long long *rx, long long *tx, char *iface, size_t ifacelen)
+{
+    FILE *f;
+    char line[512];
+    long long r = 0, t = 0;
+
+    f = fopen("/proc/net/dev", "r");
+    if (!f) return 0;
+    if (iface && ifacelen) iface[0] = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *colon = strchr(line, ':'), *name = line, *p;
+        long long v[16];
+        int i;
+
+        while (*name == ' ' || *name == '\t') name++;
+        if (!colon || colon < name) continue;
+        *colon = 0;
+        for (p = name + strlen(name); p > name && (p[-1] == ' ' || p[-1] == '\t'); p--) p[-1] = 0;
+        if (!*name) continue;
+        if (!strcmp(name, "lo") || !strncmp(name, "veth", 4) || !strncmp(name, "docker", 6) ||
+            !strncmp(name, "br-", 3) || !strncmp(name, "virbr", 5)) continue;
+
+        p = colon + 1;
+        for (i = 0; i < 16; i++) {
+            char *end;
+            v[i] = strtoll(p, &end, 10);
+            if (end == p) break;
+            p = end;
+        }
+        if (i < 9) continue;
+        r += v[0];   /* 收 */
+        t += v[8];   /* 发 */
+        if (iface && ifacelen && !iface[0]) snprintf(iface, ifacelen, "%s", name);
+    }
+    fclose(f);
+    *rx = r;
+    *tx = t;
+    return 1;
+}
+
+static void *net_thread(void *arg)
+{
+    long long prx = -1, ptx = 0, pts = 0;
+
+    (void)arg;
+    for (;;) {
+        long long rx, tx, now = (long long)time(NULL);
+        char iface[64];
+        int got = net_read(&rx, &tx, iface, sizeof iface);
+
+        if (got) {
+            long long dls = 0;
+            pthread_mutex_lock(&g_lock);
+            if (prx >= 0 && now > pts && rx >= prx) {
+                dls = now - pts;
+                g_net_rx_rate = (rx - prx) / dls;
+                g_net_tx_rate = (tx - ptx) / dls;
+            }
+            g_net_rx = rx; g_net_tx = tx; g_net_ts = now;
+            if (iface[0]) snprintf(g_net_iface, sizeof g_net_iface, "%s", iface);
+            pthread_mutex_unlock(&g_lock);
+            prx = rx; ptx = tx; pts = now;
+        }
+        sleep(2);
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* 首页板块配置（steward-prefs.json）                                   */
+/* ------------------------------------------------------------------ */
+
+static const char *BLOCK_IDS[] = { "disk", "net", "videos", "queue", "gate", NULL };
+
+static int block_known(const char *id)
+{
+    int i;
+    for (i = 0; BLOCK_IDS[i]; i++) if (!strcmp(BLOCK_IDS[i], id)) return 1;
+    return 0;
+}
+
+static int api_net(buf_t *out, char *err, size_t errlen)
+{
+    long long now;
+    int age = -1;
+
+    (void)err; (void)errlen;
+    now = (long long)time(NULL);
+    buf_puts(out, "{\"ok\":true,\"file\":\"/proc/net/dev\"");
+    pthread_mutex_lock(&g_lock);
+    if (g_net_ts) age = (int)(now - g_net_ts);
+    buf_puts(out, ",\"iface\":");
+    json_str(out, g_net_iface);
+    buf_printf(out, ",\"rxRate\":%lld,\"txRate\":%lld,\"rx\":%lld,\"tx\":%lld"
+                    ",\"ts\":%lld,\"age\":%d",
+               g_net_rx_rate, g_net_tx_rate, g_net_rx, g_net_tx, g_net_ts, age);
+    pthread_mutex_unlock(&g_lock);
+    buf_printf(out, ",\"prefsFile\":");
+    json_str(out, g_prefs_path);
+    buf_putc(out, '}');
+    return 1;
+}
+
+static int api_prefs_get(buf_t *out, char *err, size_t errlen)
+{
+    FILE *f;
+    char raw[2048];
+    size_t n;
+
+    (void)err; (void)errlen;
+    n = 0;
+    f = g_prefs_path[0] ? fopen(g_prefs_path, "r") : NULL;
+    if (f) {
+        n = fread(raw, 1, sizeof raw - 1, f);
+        fclose(f);
+        raw[n] = 0;
+    }
+    /* 文件不在或者读出来不像个 JSON 对象 -> prefs 给 null，页面用自带默认 */
+    while (n > 0 && (raw[n-1] == '\n' || raw[n-1] == '\r' || raw[n-1] == ' ')) raw[--n] = 0;
+    {
+        char *p = raw;
+        while (*p == ' ' || *p == '\t') p++;
+        buf_puts(out, "{\"ok\":true,\"file\":");
+        json_str(out, g_prefs_path);
+        if (*p == '{' && n > 0 && strstr(p, "\"blocks\"")) {
+            buf_puts(out, ",\"prefs\":");
+            buf_puts(out, p);
+        } else {
+            buf_puts(out, ",\"prefs\":null");
+        }
+        buf_putc(out, '}');
+    }
+    return 1;
+}
+
+/* POST /api/prefs  {"blocks":["disk","net","videos","queue","gate"]}
+ * 只认白名单里的块名，去重，写回一份规范化的文件（不存页面上送来的原文）。 */
+static int api_prefs_post(const char *body, buf_t *out, char *err, size_t errlen)
+{
+    const char *p;
+    buf_t canon;
+    FILE *f;
+    int n = 0;
+
+    if (!body) { snprintf(err, errlen, "空请求"); return 0; }
+    p = strstr(body, "\"blocks\"");
+    if (!p) { snprintf(err, errlen, "没给 blocks"); return 0; }
+    p = strchr(p, '[');
+    if (!p) { snprintf(err, errlen, "blocks 不是数组"); return 0; }
+
+    buf_init(&canon);
+    buf_puts(&canon, "{\"blocks\":[");
+    for (p++; *p && *p != ']'; ) {
+        char id[32];
+        size_t k = 0;
+
+        if (*p != '"') { p++; continue; }
+        p++;
+        while (*p && *p != '"' && k < sizeof id - 1) {
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_' || *p == '-')) {
+                buf_free(&canon);
+                snprintf(err, errlen, "块名里有不认的字符");
+                return 0;
+            }
+            id[k++] = *p++;
+        }
+        if (*p != '"') { buf_free(&canon); snprintf(err, errlen, "块名没闭合"); return 0; }
+        p++;
+        id[k] = 0;
+        if (!block_known(id)) { buf_free(&canon); snprintf(err, errlen, "不认识的块：%.20s", id); return 0; }
+        {
+            char pat[40];
+            snprintf(pat, sizeof pat, "\"%s\"", id);
+            if (strstr(canon.p, pat)) continue;   /* 去重 */
+        }
+        if (n) buf_putc(&canon, ',');
+        buf_printf(&canon, "\"%s\"", id);
+        n++;
+    }
+    buf_puts(&canon, "]}");
+
+    if (!g_prefs_path[0]) {
+        buf_free(&canon);
+        snprintf(err, errlen, "没定下 prefs 文件位置");
+        return 0;
+    }
+    f = fopen(g_prefs_path, "w");
+    if (!f) {
+        buf_free(&canon);
+        snprintf(err, errlen, "写不了 %.200s（%s）", g_prefs_path, strerror(errno));
+        return 0;
+    }
+    fprintf(f, "%s\n", canon.p);
+    if (fflush(f) != 0) { fclose(f); buf_free(&canon);
+        snprintf(err, errlen, "写 %.200s 失败", g_prefs_path); return 0; }
+    fclose(f);
+
+    buf_printf(out, "{\"ok\":true,\"blocks\":%d,\"prefs\":", n);
+    buf_puts(out, canon.p);
+    buf_puts(out, ",\"file\":");
+    json_str(out, g_prefs_path);
+    buf_putc(out, '}');
+    buf_free(&canon);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2170,7 +2391,8 @@ static void handle_conn(int fd)
     if (!strcmp(r.path, "/api/records") || !strcmp(r.path, "/api/files") ||
         !strcmp(r.path, "/api/delete") || !strcmp(r.path, "/api/queue") ||
         !strcmp(r.path, "/api/purge") || !strcmp(r.path, "/api/watch") ||
-        !strcmp(r.path, "/api/disk") || !strcmp(r.path, "/api/brake")) {
+        !strcmp(r.path, "/api/disk") || !strcmp(r.path, "/api/brake") ||
+        !strcmp(r.path, "/api/net") || !strcmp(r.path, "/api/prefs")) {
         if (!token_ok(&r)) {
             http_err_json(fd, 403, "token 不对（URL 或请求头要带 token）");
             goto out;
@@ -2201,6 +2423,15 @@ static void handle_conn(int fd)
         else http_err_json(fd, 400, err);
     } else if (!strcmp(r.method, "POST") && !strcmp(r.path, "/api/brake")) {
         if (api_brake(r.body ? r.body : "", &out, err, sizeof err)) http_json(fd, &out);
+        else http_err_json(fd, 400, err);
+    } else if (!strcmp(r.method, "GET") && !strcmp(r.path, "/api/net")) {
+        if (api_net(&out, err, sizeof err)) http_json(fd, &out);
+        else http_err_json(fd, 500, err);
+    } else if (!strcmp(r.method, "GET") && !strcmp(r.path, "/api/prefs")) {
+        if (api_prefs_get(&out, err, sizeof err)) http_json(fd, &out);
+        else http_err_json(fd, 500, err);
+    } else if (!strcmp(r.method, "POST") && !strcmp(r.path, "/api/prefs")) {
+        if (api_prefs_post(r.body ? r.body : "", &out, err, sizeof err)) http_json(fd, &out);
         else http_err_json(fd, 400, err);
     } else {
         http_send(fd, 404, "text/plain; charset=utf-8", "not found\n", 10);
@@ -2364,6 +2595,7 @@ int main(int argc, char **argv)
         }
         snprintf(g_brake_path, sizeof g_brake_path, "%.3920s/steward-brake-sources.txt", dir);
         snprintf(g_watch_path, sizeof g_watch_path, "%.3920s/steward-ondisk.txt", dir);
+        snprintf(g_prefs_path, sizeof g_prefs_path, "%.3920s/steward-prefs.json", dir);
     }
     if (access(g_brake_path, F_OK) == 0) {
         g_braked = 1;
@@ -2406,6 +2638,9 @@ int main(int argc, char **argv)
 
     if (pthread_create(&th, NULL, disk_thread, NULL) == 0) pthread_detach(th);
     else fprintf(stderr, "[warn] 磁盘闸门线程没起来\n");
+
+    if (pthread_create(&th, NULL, net_thread, NULL) == 0) pthread_detach(th);
+    else fprintf(stderr, "[warn] 网速采样线程没起来\n");
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return 1; }

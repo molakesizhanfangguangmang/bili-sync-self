@@ -9,7 +9,10 @@
    （iframe 是另一个源，读不到父页面的主题，只能这么传）；直接打开本页时按系统偏好走。
    在 <style> 之前跑，免得先亮一下再变暗。 */
 (function () {
-	var want = new URLSearchParams(location.search).get('theme');
+	var q = new URLSearchParams(location.search);
+	var want = q.get('theme');
+	/* embed=1：被首页 iframe 套着时用，只渲染概览那几块 */
+	if (q.get('embed')) document.documentElement.dataset.embed = '1';
 	var mq = window.matchMedia('(prefers-color-scheme: dark)');
 	function apply() {
 		var dark = (want === 'dark' || want === 'light') ? want === 'dark' : mq.matches;
@@ -113,6 +116,48 @@
     display:inline-block;font-size:11px;padding:0 6px;border-radius:5px;
     border:1px solid #d6dade;background:#f2f4f6;color:var(--none);margin-left:6px;
   }
+
+  /* ---- 首页仪表盘 ---- */
+  .dashbar{display:flex;align-items:center;gap:8px;margin:16px 0 8px}
+  .dashbar .t{font-size:12.5px;color:var(--dim);letter-spacing:.04em}
+  .blkwrap{position:relative}
+  .blkmenu{
+    position:absolute;right:0;top:31px;z-index:12;min-width:158px;padding:6px;
+    border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.98);
+    box-shadow:0 8px 22px rgba(20,30,40,.13);
+  }
+  .blkmenu label{
+    display:flex;gap:8px;align-items:center;padding:4px 8px;border-radius:6px;
+    cursor:pointer;font-size:12.5px;
+  }
+  .blkmenu label:hover{background:#eef1f4}
+  .blkmenu .sp{border-top:1px solid var(--line);margin:5px 0}
+  .blkmenu button.nb{
+    width:100%;text-align:left;border:0;background:transparent;color:var(--accent);
+    cursor:pointer;font:inherit;font-size:12.5px;padding:4px 8px;border-radius:6px;
+  }
+  .blkmenu button.nb:hover{background:#eef1f4}
+  .dash{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+  .card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px 12px;min-width:0}
+  .card .h{font-size:12px;color:var(--dim)}
+  .card .big{
+    font-size:19px;font-weight:600;margin-top:4px;letter-spacing:.01em;
+    font-variant-numeric:tabular-nums;word-break:break-all;
+  }
+  .card .big.sm{font-size:15px}
+  .card .m{font-size:12px;color:var(--dim);margin-top:3px;word-break:break-all}
+  .card .m b{font-weight:600;color:#4c545a}
+  .card .m .hi{color:var(--ok)}
+  .card .m .lo{color:var(--bad)}
+  .dash-empty{
+    color:var(--dim);font-size:12.5px;border:1px dashed var(--line);
+    border-radius:10px;padding:14px;text-align:center;
+  }
+  .sw{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--dim)}
+  .sw input{margin:0;cursor:pointer}
+  .sw input:checked + span{color:var(--ok)}
+  .sw input:disabled + span{opacity:.5}
+  .rb{margin-top:5px;line-height:1.5}
   .group-head{
     display:flex;gap:10px;align-items:center;padding:8px 12px;
     background:rgba(240,243,246,.9);border-top:1px solid #e4e9ee;
@@ -157,6 +202,13 @@
   [data-theme=dark] .group-head{background:rgba(255,255,255,.04);border-top-color:#2b3037;color:#b9c0c7}
   [data-theme=dark] .ghost{color:#7d848b}
   [data-theme=dark] .foot{background:rgba(21,24,27,.94)}
+  [data-theme=dark] .blkmenu{background:#1d2126;box-shadow:0 8px 22px rgba(0,0,0,.45)}
+  [data-theme=dark] .blkmenu label:hover,[data-theme=dark] .blkmenu button.nb:hover{background:#262b30}
+  [data-theme=dark] .card .m b{color:#b9c0c7}
+  /* embed=1：首页只嵌概览块，标题 / 板块按钮 / tab / 页脚都收起来 */
+  [data-embed] body{padding:14px 14px 16px;background:transparent}
+  [data-embed] header,[data-embed] .dashbar,[data-embed] nav.tabs,
+  [data-embed] section[id^=tab-],[data-embed] .foot{display:none!important}
 </style>
 </head>
 <body>
@@ -171,6 +223,16 @@
     <span class="grow"></span>
     <button class="plain" id="btn-release" hidden>恢复被停用的源</button>
   </div>
+
+  <div class="dashbar">
+    <span class="t">概览</span>
+    <span class="grow"></span>
+    <div class="blkwrap">
+      <button class="plain" id="btn-blk">板块</button>
+      <div class="blkmenu" id="blkmenu" hidden></div>
+    </div>
+  </div>
+  <div class="dash" id="dash"></div>
 
   <nav class="tabs">
     <button data-tab="rec" class="on">视频清单</button>
@@ -309,10 +371,106 @@ const esc = (s) => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','
 
 let REC = { records: [], summary:{}, queue:{}, count:0 };
 let FILES = { groups: [], count:0, totalSize:0 };
+let DISK = {};
+let NET = { rxRate:0, txRate:0, age:-1, iface:'' };
 let fStatus = '', fGroup = '', fQuery = '';
 let qBucket = 'pending', qQuery = '';
 let fSrc = '', fSort = 'group';
-let diskTimer = null;
+let diskTimer = null, netTimer = null;
+
+/* ---------------- 首页仪表盘 ---------------- */
+/* 板块的显隐存在服务端（steward-prefs.json，跟 data.sqlite 一个目录），
+   换浏览器/换设备进来是同一份配置。 */
+const BLOCKS = [
+  { id:'disk',   name:'磁盘' },
+  { id:'net',    name:'网速' },
+  { id:'videos', name:'视频总账' },
+  { id:'queue',  name:'下载队列' },
+  { id:'gate',   name:'闸门与源' }
+];
+let PREFS = { blocks: BLOCKS.map(b => b.id) };
+
+const fmtRate = (b) => fmtSize(b) + '/s';
+
+function cardBody(id){
+  if(id === 'disk'){
+    const d = DISK;
+    if(!d.total) return ['读不到下载卷', esc(d.root || ''), ''];
+    const warn = d.braked ? ' <span class="lo">已拉闸</span>' : '';
+    return [fmtSize(d.free) + ' 可用',
+            `剩 <b>${d.pct}%</b> · 阈值 ${d.floor}%${warn}`,
+            `共 ${fmtSize(d.total)} · ${esc(d.root || '')}`];
+  }
+  if(id === 'net'){
+    const stale = NET.age < 0 || NET.age > 10;
+    return ['<span id="net-down">↓ ' + fmtRate(NET.rxRate) + '</span>',
+            '<span id="net-up">↑ ' + fmtRate(NET.txRate) + '</span>',
+            (stale ? '<span class="lo">采样没在跑</span>' : esc(NET.iface || 'net'))
+              + ` · 累计收 ${fmtSize(NET.rx || 0)}`];
+  }
+  if(id === 'videos'){
+    const s = REC.summary || {};
+    return [`${REC.count || 0} 条`,
+            `存在 <b class="hi">${s.exists || 0}</b> · 部分 ${s.partial || 0} · 不存在 ${s.missing || 0}`,
+            `未下载 ${s.undownloaded || 0} · 无分页 ${s.nopages || 0}`];
+  }
+  if(id === 'queue'){
+    const q = REC.queue || {};
+    return [`<span class="hi">${q.pending || 0}</span> 待下载`,
+            `已下载 <b>${q.done || 0}</b> · 不下 <b>${q.off || 0}</b>`,
+            `合计 ${(q.pending || 0) + (q.done || 0) + (q.off || 0)} 条`];
+  }
+  const d = DISK, w = d.watch || {};
+  return [d.braked ? '<span class="lo">已拉闸</span>' : '正常',
+          `阈值 ${d.floor || 0}% · 核盘 ${w.onDisk || 0} 条在盘`,
+          (w.on ? '核盘线程在跑' : '核盘线程关着') + (d.pushed ? ` · 拉闸推过 ${d.pushed} 次` : '')];
+}
+
+function renderDash(){
+  const box = document.getElementById('dash');
+  const ids = BLOCKS.map(b => b.id).filter(id => PREFS.blocks.includes(id));
+  if(!ids.length){
+    box.innerHTML = '<div class="dash-empty">板块都收起来了 —— 右上角「板块」加回来</div>';
+    return;
+  }
+  box.innerHTML = ids.map(id => {
+    const body = cardBody(id);
+    const name = BLOCKS.find(b => b.id === id).name;
+    return `<div class="card" data-b="${id}">
+      <div class="h">${esc(name)}</div>
+      <div class="big">${body[0]}</div>
+      <div class="m">${body[1]}</div>
+      ${body[2] ? `<div class="m">${body[2]}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function renderBlkMenu(){
+  const box = document.getElementById('blkmenu');
+  box.innerHTML = BLOCKS.map(b =>
+    `<label><input type="checkbox" data-b="${b.id}" ${PREFS.blocks.includes(b.id) ? 'checked' : ''}>${esc(b.name)}</label>`
+  ).join('') + '<div class="sp"></div><button class="nb" data-all="1">全都要</button>';
+  box.querySelectorAll('input[data-b]').forEach(cb => cb.onchange = () => {
+    const id = cb.dataset.b;
+    if(cb.checked){ if(!PREFS.blocks.includes(id)) PREFS.blocks.push(id); }
+    else PREFS.blocks = PREFS.blocks.filter(x => x !== id);
+    renderDash();
+    savePrefs();
+  });
+  box.querySelector('button[data-all]').onclick = () => {
+    PREFS.blocks = BLOCKS.map(b => b.id);
+    renderBlkMenu();
+    renderDash();
+    savePrefs();
+  };
+}
+
+function netCardOnly(){
+  const d = document.getElementById('net-down'), u = document.getElementById('net-up');
+  if(!d || !u) return;                    /* 网速板块被收起来了就不动 */
+  d.textContent = '↓ ' + fmtRate(NET.rxRate);
+  u.textContent = '↑ ' + fmtRate(NET.txRate);
+}
 
 /* ---------------- tab 切换 ---------------- */
 document.querySelectorAll('nav.tabs button').forEach(b => b.onclick = () => {
@@ -341,16 +499,65 @@ function renderRecords(){
     <div class="row">
       <span class="pill s-${r.status}" title="${esc(STATUS_DESC[r.status] || '')}">${STATUS_TEXT[r.status] || r.status}</span>
       <div class="main">
-        <div class="title">${esc(r.name)}${r.want ? '' : '<span class="tag" title="在下载列表里被标成不下">不下</span>'}</div>
+        <div class="title">${titleHTML(r)}</div>
         <div class="meta">${esc(r.group)} · ${esc(r.upper)} · ${esc(r.bvid)} · 分页 ${r.present}/${r.pages}${r.withPath < r.pages ? '（' + (r.pages - r.withPath) + ' 页未落盘）' : ''}${r.size ? ' · ' + fmtSize(r.size) : ''}</div>
         <div class="meta ghost">${esc(r.folder)}</div>
       </div>
-      <div class="right">${r.status === 'nopages' ? '无分页行'
-          : r.status === 'undownloaded' ? '还没下过'
-          : r.present === 0 ? '文件没了'
-          : r.present === r.pages ? '文件齐'
-          : '缺 ' + (r.pages - r.present) + ' 个'}</div>
+      <div class="right">
+        <label class="sw" title="要下 = 写回 video.should_download=1；不下只是不再下，盘上的文件不动">
+          <input type="checkbox" class="want" data-id="${r.id}" ${r.want ? 'checked' : ''}>
+          <span>${r.want ? '要下' : '不下'}</span>
+        </label>
+        <div class="rb">${r.status === 'nopages' ? '无分页行'
+            : r.status === 'undownloaded' ? '还没下过'
+            : r.present === 0 ? '文件没了'
+            : r.present === r.pages ? '文件齐'
+            : '缺 ' + (r.pages - r.present) + ' 个'}</div>
+      </div>
     </div>`).join('');
+  box.querySelectorAll('input.want').forEach(cb => cb.onchange = onWant);
+}
+
+function titleHTML(r){
+  return esc(r.name) + (r.want ? '' : '<span class="tag" title="在下载列表里被标成不下">不下</span>');
+}
+
+/* 行内开关：跟下载列表底部的「加入/移出下载队列」是同一个接口、同一件事，
+   区别只是这里一次一条。改完就地更新（不整表重绘，免得滚动位置跳走）。 */
+async function onWant(ev){
+  const cb = ev.target;
+  const id = Number(cb.dataset.id);
+  const want = cb.checked;
+  cb.disabled = true;
+  try{
+    const res = await (await fetch(api('/api/queue'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action: want ? 'want' : 'unwant', ids: [id] })
+    })).json();
+    if(!res.ok) throw new Error(res.error || '没改成');
+    const r = REC.records.find(x => x.id === id);
+    if(r){
+      const before = r.bucket;
+      r.want = want;
+      r.bucket = want ? (r.pages > 0 && r.withPath >= r.pages ? 'done' : 'pending') : 'off';
+      if(REC.queue && before !== r.bucket){
+        REC.queue[before] = Math.max(0, (REC.queue[before] || 0) - 1);
+        REC.queue[r.bucket] = (REC.queue[r.bucket] || 0) + 1;
+      }
+      const row = cb.closest('.row');
+      if(row){
+        cb.parentElement.querySelector('span').textContent = want ? '要下' : '不下';
+        const t = row.querySelector('.title');
+        if(t) t.innerHTML = titleHTML(r);
+      }
+      renderDash();
+      syncSel();
+    }
+  }catch(e){
+    cb.checked = !want;
+    alert('改不动：' + e.message);
+  }
+  cb.disabled = false;
 }
 
 function fillGroupSelect(){
@@ -573,9 +780,40 @@ async function loadRecords(){
       `${res.count} 条记录 · 存在 ${s.exists} / 部分 ${s.partial} / 不存在 ${s.missing}` +
       (s.undownloaded ? ` / 未下载 ${s.undownloaded}` : '') +
       (s.nopages ? ` / 无分页 ${s.nopages}` : '');
+    renderDash();
   }catch(e){
     box.innerHTML = `<div class="empty err">读取失败：${esc(e)}</div>`;
   }
+}
+
+async function loadNet(){
+  try{
+    const d = await (await fetch(api('/api/net'))).json();
+    if(!d.ok) return;
+    NET = d;
+    netCardOnly();
+  }catch(e){ /* 读不到就留着上一次的数 */ }
+}
+
+async function loadPrefs(){
+  try{
+    const d = await (await fetch(api('/api/prefs'))).json();
+    const known = BLOCKS.map(b => b.id);
+    if(d.ok && d.prefs && Array.isArray(d.prefs.blocks))
+      PREFS.blocks = d.prefs.blocks.filter(id => known.includes(id));
+  }catch(e){ /* 拿不到就用默认：全都摆上 */ }
+  renderBlkMenu();
+  renderDash();
+}
+
+async function savePrefs(){
+  try{
+    const res = await (await fetch(api('/api/prefs'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ blocks: PREFS.blocks })
+    })).json();
+    if(!res.ok) alert('板块配置没存上：' + (res.error || ''));
+  }catch(e){ alert('板块配置没存上：' + e.message); }
 }
 
 async function loadFiles(){
@@ -597,6 +835,7 @@ async function loadDisk(){
   try{
     const d = await (await fetch(api('/api/disk'))).json();
     if(!d.ok) return;
+    DISK = d;
     let txt = d.total
       ? `下载卷 ${d.root} 剩余 ${fmtSize(d.free)}（${d.pct}%）`
       : `读不到下载卷 ${d.root}`;
@@ -606,10 +845,18 @@ async function loadDisk(){
     el.hidden = false;
     el.classList.toggle('warn', !!d.braked);
     document.getElementById('btn-release').hidden = !d.braked;
+    renderDash();
   }catch(e){ /* 盘读不到就不显示横幅 */ }
 }
 
 /* ---------------- 事件 ---------------- */
+document.getElementById('btn-blk').onclick = (e) => {
+  e.stopPropagation();
+  const m = document.getElementById('blkmenu');
+  m.hidden = !m.hidden;
+};
+document.getElementById('blkmenu').onclick = (e) => e.stopPropagation();
+document.addEventListener('click', () => { document.getElementById('blkmenu').hidden = true; });
 document.getElementById('f-q').oninput = e => { fQuery = e.target.value; renderRecords(); };
 document.getElementById('f-group').onchange = e => { fGroup = e.target.value; renderRecords(); };
 document.getElementById('loc-src').onchange = e => { fSrc = e.target.value; renderFiles(); };
@@ -696,10 +943,23 @@ document.getElementById('btn-release').onclick = async () => {
   b.disabled = false;
 };
 
+loadPrefs();
 loadRecords();
 loadFiles();
 loadDisk();
+loadNet();
 diskTimer = setInterval(loadDisk, 60000);
+netTimer = setInterval(loadNet, 2000);
+
+/* embed=1：把高度报给父页面，那边照着撑 iframe 的框（块可增删、数字会变行） */
+function reportHeight(){
+  if(!document.documentElement.dataset.embed) return;
+  try{ parent.postMessage({ height: document.documentElement.scrollHeight }, '*'); }catch(e){}
+}
+if(document.documentElement.dataset.embed){
+  window.addEventListener('resize', reportHeight);
+  setInterval(reportHeight, 700);
+}
 </script>
 </body>
 </html>

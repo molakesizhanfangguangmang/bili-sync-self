@@ -56,6 +56,22 @@
 
 页面跟随系统明暗：浅色是毛玻璃，深色换成深底 + 低饱和的状态色。被别的界面嵌进 iframe 时，对方可以在地址上带 `?theme=dark|light` 指定（iframe 是独立的源，读不到父页面的主题，只能这么传）；不带这个参数就按系统偏好，跟着系统变。
 
+## 首页概览
+
+打开页面最上面几块，不点进任何视图就能看：
+
+| 板块 | 里面是什么 |
+| --- | --- |
+| 磁盘 | 下载卷可用空间、剩余百分比与阈值，低于阈值就标「已拉闸」 |
+| 网速 | 容器网口的实时收/发速率、网口名、累计收了多少 |
+| 视频总账 | 记录条数，以及存在 / 部分 / 不存在 / 未下载 / 无分页各多少 |
+| 下载队列 | 待下载 / 已下载 / 不下 三档的条数 |
+| 闸门与源 | 闸门合着没有、阈值多少、核盘线程在不在、拉闸推过几次 |
+
+右上「板块」按钮勾选要显示哪几块（「全都要」一次全勾）。选择存在 `steward-prefs.json`，跟 `data.sqlite` 同目录（bind mount），容器重建之后还在。
+
+被别的页面套进 iframe 时地址上带 `?embed=1` 就只渲染这几块（页头、标签、页脚都收起来）；`?theme=dark|light` 也由父页面传。
+
 ## 库里另外两件事
 
 **新加的源默认带上过滤规则。** 四个 `AFTER INSERT` 触发器（`steward_default_rule_*`），源入库那一刻把「收藏时间/发布时间 > 此刻」写进 `rule`。触发器跑在 bili-sync 自己的写事务里，所以不存在「源已经入库、规则还没写」的窗口；不然新源的头一轮会把整个历史投稿拖下来，几分钟就能填满盘。自己写过规则的源一律不覆盖。规则的具体形状（`[[{"field":...,"rule":{"operator":...,"value":...}}]]`）是上游自己那套 serde 格式，在 bili-sync 里点开源的详情能看到它渲染出来的中文描述。
@@ -74,7 +90,7 @@
 
 - 产物是静态单文件，aarch64，约 1.8 MB：SQLite amalgamation 链进去，运行时零依赖。目标容器里没有 python / node / curl，也不需要。
 - 没有 Dockerfile、没有自己的镜像、没有常驻依赖。装进去的东西就是三个文件加一个二进制，全在 bind mount 里，容器重建不用重装。
-- 前端是一张内嵌的 HTML（约 25 KB，无外部资源、无框架），页面每次请求现算。
+- 前端是一张内嵌的 HTML（约 45 KB，无外部资源、无框架），页面每次请求现算。
 - 除了 GNU libc 和 SQLite（公有领域），没有第三方代码。
 
 ## 编译
@@ -157,6 +173,9 @@ docker exec bili-sync-rs /app/.config/bili-sync/steward/steward --db /app/.confi
 | GET | `/api/records` | 清单 + 本地状态 + 三档计数（JSON） |
 | GET | `/api/files` | `/downloads` 扫描结果（JSON） |
 | GET | `/api/disk` | 卷用量、阈值、闸门状态（JSON） |
+| GET | `/api/net` | 容器网口的收发速率、累计字节、网口名（JSON） |
+| GET | `/api/prefs` | 首页板块配置；一次都没存过返回 `null` |
+| POST | `/api/prefs` | `{"blocks":["disk","net","videos","queue","gate"]}`，不认识的块名 400 |
 | POST | `/api/delete` | `{"paths":["/downloads/.../某个视频"]}` |
 | POST | `/api/queue` | `{"action":"want\|unwant\|delete\|redownload","ids":[12,34]}` |
 | POST | `/api/purge` | `{"action":"stale"}` 清理僵尸完成标记；`{"action":"stale","dry":true}` 只数不改 |
@@ -178,13 +197,17 @@ steward --pending-off   # 把「要下、但一页都没落过盘」的条目改
 不需要 docker，也不需要真的 bili-sync 数据（夹具从真实 `data.sqlite` 拷一份出来改）：
 
 ```sh
-python3 test/run_tests.py        # 起进程打接口，157 项断言（会先自动重建夹具）
+python3 test/run_tests.py        # 起进程打接口，176 项断言（会先自动重建夹具）
 python3 test/browser_check.py    # 点真页面，走本机 CDP，验三档筛选与队列动作
 ```
 
 `run_tests.py` 每次先重建夹具——它会真删夹具里的目录、真改夹具里的库。想接着上一次的跑，`FV_KEEP_FIXTURE=1 python3 test/run_tests.py`。
 
-覆盖到：五档状态、孤儿文件夹、删除护栏（根目录/源目录/上级/`..`/不存在）、token、坏 body、原样 UTF-8 请求体、三档计数与四条队列动作、`--init` 与 `--pending-off`、触发器的字段与时刻、闸门（低于阈值自动拉闸 → 快照 → 推送 → 恢复）、坏快照只认白名单、核盘推送（基线不推 → 补回文件推「下载完成」→ 删掉文件推「文件不在了」→ 重新基线）。
+覆盖到：五档状态、孤儿文件夹、删除护栏（根目录/源目录/上级/`..`/不存在）、token、坏 body、原样 UTF-8 请求体、三档计数与四条队列动作、`--init` 与 `--pending-off`、触发器的字段与时刻、闸门（低于阈值自动拉闸 → 快照 → 推送 → 恢复）、坏快照只认白名单、核盘推送（基线不推 → 补回文件推「下载完成」→ 删掉文件推「文件不在了」→ 重新基线）、网速采样与首页板块配置（落盘、去重、白名单、空数组）。
+
+夹具要从真实库里拷一份底子，所以给个路径：`BILI_SYNC_DB=/vol1/@appdata/bili-sync/data.sqlite python3 test/run_tests.py`（默认按容器里的 `/app/.config/bili-sync/data.sqlite` 找）。
+
+拿当前这个真实库做底子时，176 项里 175 过：挂的是「删完文件夹后该条变不存在」那条。旧版（`0e65111`）用同一个底子跑也是同样一条挂，跟这次改动没关系，是夹具底子挑中的那条记录的事。
 
 `test/browser_check.py` 会真点页面上的按钮（含把某一档在「要下 / 不下」之间来回切一次），跑完记录复原；不删文件、不重下。
 

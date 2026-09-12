@@ -1,0 +1,9 @@
+# 构建产物
+.obj/
+dist/
+*.o
+
+# 离线测试夹具 / python 缓存
+__pycache__/
+*.pyc
+*.log

@@ -10,7 +10,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `.github/workflows/self-build.yaml` | 全部流程：拉上游 → 打补丁 → bun 编前端 → cross 编 aarch64 → 打包上传 |
-| `bili-sync-self.patch` | 对上游 `web/` 的两处改动（见下）。只碰这两个文件 |
+| `bili-sync-self.patch` | 对上游 `web/` 的三处改动（见下）：改一个已有组件、改一个已有页面、加一个新页面 |
 | `HARNESS.md` | 本文件 |
 
 补丁内容：
@@ -18,6 +18,8 @@
 - `web/src/lib/components/app-sidebar.svelte`：「内容管理」组加一项「存储」→ `/storage`
 - `web/src/routes/storage/+page.svelte`：新增，iframe 指向 `location.hostname:12346`（steward），
   并把当前明暗当 `?theme=dark|light` 一起带过去（steward 认这个参数，直接打开它自己的页面时按系统偏好）
+- `web/src/routes/+page.svelte`：首页最上面加一块「管家」iframe（同 `/storage` 的地址与明暗传参），
+  上游原有的仪表盘内容原样留在下面
 
 ## 为什么不是真 fork
 

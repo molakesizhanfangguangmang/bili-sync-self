@@ -24,6 +24,48 @@ index 7045931..769e4d8 100644
  				]
  			},
  			{
+diff --git a/web/src/routes/+page.svelte b/web/src/routes/+page.svelte
+index 9d360bf..092a162 100644
+--- a/web/src/routes/+page.svelte
++++ b/web/src/routes/+page.svelte
+@@ -164,6 +164,19 @@
+ 			}
+ 		};
+ 	});
++	// 管家（steward）跑在同一个容器里，宿主映射 12346。首页最上面嵌它的概览。
++	// iframe 是另一个源，读不到本页的主题，所以把当前明暗当查询参数带过去。
++	let stewardSrc = $state('');
++	onMount(() => {
++		const theme = () => (document.documentElement.classList.contains('dark') ? 'dark' : 'light');
++		const url = () => `${location.protocol}//${location.hostname}:12346/?theme=${theme()}`;
++		stewardSrc = url();
++		const observer = new MutationObserver(() => {
++			stewardSrc = url();
++		});
++		observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
++		return () => observer.disconnect();
++	});
+ </script>
+ 
+ <svelte:head>
+@@ -171,6 +184,17 @@
+ </svelte:head>
+ 
+ <div class="space-y-6">
++	<div class="space-y-3">
++		<div class="text-muted-foreground text-sm font-medium">管家 · 概览与清单</div>
++		{#if stewardSrc}
++			<iframe
++				src={stewardSrc}
++				title="steward"
++				class="bg-background h-[80vh] w-full rounded-lg border"
++			></iframe>
++		{/if}
++	</div>
++
+ 	{#if loading}
+ 		<div class="flex items-center justify-center py-12">
+ 			<div class="text-muted-foreground">加载中...</div>
 diff --git a/web/src/routes/storage/+page.svelte b/web/src/routes/storage/+page.svelte
 new file mode 100644
 index 0000000..f7565f8

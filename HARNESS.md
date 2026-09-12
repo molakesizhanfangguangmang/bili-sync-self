@@ -25,7 +25,8 @@
 - `web/src/routes/+page.svelte`：首页仪表盘重做。上游原本写死的几块拆成可选板块，
   一律用上游自带的 Card / Badge / Progress / Chart 渲染：存储空间、当前监听、最近入库、
   下载任务状态、内存、CPU、网络速率、下载队列（待下载 / 已下载 / 不下）、视频总账（总数 / 有效 / 失效）。
-  六列栅格，每块自带 span，几行正好铺满。页头有「编辑板块」按钮，弹窗里开关 + 上下调顺序，保存后写服务端。
+  等宽栅格（md 两列、xl 三列），每块一样大——板块顺序可以随便调，固定大小才不会在行里留出空档。
+  页头有「编辑板块」按钮，弹窗里开关 + 上下调顺序，保存后写服务端。
 - `web/src/lib/api.ts`、`web/src/lib/types.ts`：加 `/dashboard-layout` 的读写方法与类型；
   `SysInfo` 加 `net_rx_speed` / `net_tx_speed`；`DashBoardResponse` 加队列与总账几个计数
 

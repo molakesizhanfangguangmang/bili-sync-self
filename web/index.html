@@ -4,6 +4,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>bili-sync 管家</title>
+<script>
+/* 明暗：被 bili-sync 前端套进 iframe 时那边会把当前主题当 ?theme=dark|light 传过来
+   （iframe 是另一个源，读不到父页面的主题，只能这么传）；直接打开本页时按系统偏好走。
+   在 <style> 之前跑，免得先亮一下再变暗。 */
+(function () {
+	var want = new URLSearchParams(location.search).get('theme');
+	var mq = window.matchMedia('(prefers-color-scheme: dark)');
+	function apply() {
+		var dark = (want === 'dark' || want === 'light') ? want === 'dark' : mq.matches;
+		document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+	}
+	apply();
+	if (mq.addEventListener) mq.addEventListener('change', apply);
+	else if (mq.addListener) mq.addListener(apply);
+})();
+</script>
 <style>
   :root{
     --bg:#eef1f4; --card:rgba(255,255,255,.72); --line:#dfe3e8; --ink:#22262b;
@@ -115,6 +131,32 @@
   .foot .grp{display:flex;gap:10px}
   .err{color:var(--bad)}
   [hidden]{display:none !important}
+
+  /* ---- 暗色：只覆盖颜色，不动布局。值挑的是暗底上仍看得清的那一档 ---- */
+  :root[data-theme=dark]{
+    --bg:#15181b; --card:rgba(255,255,255,.045); --line:#2e343b; --ink:#e3e6e9;
+    --dim:#98a0a8; --accent:#7fa8d4; --ok:#7fc3a0; --part:#d3b06a; --bad:#dd9b93; --none:#9aa1a8;
+  }
+  [data-theme=dark] .banner{background:rgba(255,255,255,.05)}
+  [data-theme=dark] .banner.warn{background:#30201d;border-color:#5c3b36;color:#dd9b93}
+  [data-theme=dark] nav.tabs button.on{background:rgba(255,255,255,.10);border-color:#464d55}
+  [data-theme=dark] select,[data-theme=dark] input[type=text]{background:rgba(255,255,255,.06)}
+  [data-theme=dark] .chips button.on{background:#2c3239;border-color:#464d55}
+  [data-theme=dark] .chips button b{color:#c3c9cf}
+  [data-theme=dark] .help{border-color:#4a5158}
+  [data-theme=dark] .help .tip{background:#22262b;box-shadow:0 8px 22px rgba(0,0,0,.5)}
+  [data-theme=dark] button.danger{border-color:#5c3b36;background:#30201d;color:#dd9b93}
+  [data-theme=dark] button.plain{background:rgba(255,255,255,.08)}
+  [data-theme=dark] .row{border-top-color:#2b3037}
+  [data-theme=dark] .s-exists{color:#7fc3a0;border-color:#31594385;background:#1a2a22}
+  [data-theme=dark] .s-partial{color:#d3b06a;border-color:#5c4c2285;background:#2a2416}
+  [data-theme=dark] .s-missing{color:#dd9b93;border-color:#5c3b3685;background:#2b1d1b}
+  [data-theme=dark] .s-nopages{color:#9aa1a8;border-color:#3c424a;background:#23272c}
+  [data-theme=dark] .s-undownloaded{color:#93a7c0;border-color:#3a4655;background:#1c232b}
+  [data-theme=dark] .tag{border-color:#3c424a;background:#23272c;color:#9aa1a8}
+  [data-theme=dark] .group-head{background:rgba(255,255,255,.04);border-top-color:#2b3037;color:#b9c0c7}
+  [data-theme=dark] .ghost{color:#7d848b}
+  [data-theme=dark] .foot{background:rgba(21,24,27,.94)}
 </style>
 </head>
 <body>

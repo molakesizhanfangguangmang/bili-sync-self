@@ -18,8 +18,9 @@
 - `web/src/lib/components/app-sidebar.svelte`：「内容管理」组加一项「存储」→ `/storage`
 - `web/src/routes/storage/+page.svelte`：新增，iframe 指向 `location.hostname:12346`（steward），
   并把当前明暗当 `?theme=dark|light` 一起带过去（steward 认这个参数，直接打开它自己的页面时按系统偏好）
-- `web/src/routes/+page.svelte`：首页最上面加一块「管家」iframe（同 `/storage` 的地址与明暗传参），
-  上游原有的仪表盘内容原样留在下面
+- `web/src/routes/+page.svelte`：首页最上面加一块「管家 · 概览」iframe，只嵌管家的概览块
+  （地址多带 `embed=1`，管家认这个参数，把标题/tab/页脚收起来）；高度不写死，由管家 `postMessage` 量好
+  再撑开（120–1400px 之间）。上游原有的仪表盘内容原样留在下面
 
 ## 为什么不是真 fork
 

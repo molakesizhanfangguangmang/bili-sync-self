@@ -25,40 +25,54 @@ index 7045931..769e4d8 100644
  			},
  			{
 diff --git a/web/src/routes/+page.svelte b/web/src/routes/+page.svelte
-index 9d360bf..092a162 100644
+index 9d360bf..0fbcee4 100644
 --- a/web/src/routes/+page.svelte
 +++ b/web/src/routes/+page.svelte
-@@ -164,6 +164,19 @@
+@@ -164,6 +164,32 @@
  			}
  		};
  	});
-+	// 管家（steward）跑在同一个容器里，宿主映射 12346。首页最上面嵌它的概览。
-+	// iframe 是另一个源，读不到本页的主题，所以把当前明暗当查询参数带过去。
++	// 管家（steward）跑在同一个容器里，宿主映射 12346，首页只嵌它的概览那几块。
++	// iframe 是另一个源，读不到本页的主题，所以把当前明暗当查询参数带过去；
++	// embed=1 让管家只渲染概览块（标题 / tab / 页脚都收起来）。
 +	let stewardSrc = $state('');
++	let stewardHeight = $state(460);
 +	onMount(() => {
 +		const theme = () => (document.documentElement.classList.contains('dark') ? 'dark' : 'light');
-+		const url = () => `${location.protocol}//${location.hostname}:12346/?theme=${theme()}`;
++		const origin = () => `${location.protocol}//${location.hostname}:12346`;
++		const url = () => `${origin()}/?embed=1&theme=${theme()}`;
 +		stewardSrc = url();
 +		const observer = new MutationObserver(() => {
 +			stewardSrc = url();
 +		});
 +		observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
-+		return () => observer.disconnect();
++		// 块的高度不固定（块可增删、数字会变行），让管家自己量好之后 postMessage 过来
++		const onMessage = (e: MessageEvent) => {
++			if (e.origin !== origin()) return;
++			const h = Number((e.data as { height?: number })?.height) || 0;
++			if (h > 120) stewardHeight = Math.min(Math.round(h), 1400);
++		};
++		window.addEventListener('message', onMessage);
++		return () => {
++			observer.disconnect();
++			window.removeEventListener('message', onMessage);
++		};
 +	});
  </script>
  
  <svelte:head>
-@@ -171,6 +184,17 @@
+@@ -171,6 +197,18 @@
  </svelte:head>
  
  <div class="space-y-6">
 +	<div class="space-y-3">
-+		<div class="text-muted-foreground text-sm font-medium">管家 · 概览与清单</div>
++		<div class="text-muted-foreground text-sm font-medium">管家 · 概览</div>
 +		{#if stewardSrc}
 +			<iframe
 +				src={stewardSrc}
 +				title="steward"
-+				class="bg-background h-[80vh] w-full rounded-lg border"
++				style={`height:${stewardHeight}px`}
++				class="bg-background w-full rounded-lg border"
 +			></iframe>
 +		{/if}
 +	</div>

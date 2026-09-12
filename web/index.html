@@ -207,12 +207,22 @@
   <section id="tab-loc" hidden>
     <div class="bar">
       <label class="cb"><input type="checkbox" id="sel-all"> 全选</label>
+      <select id="loc-src"></select>
+      <select id="loc-sort">
+        <option value="group">按来源分组</option>
+        <option value="time-desc">时间：新 → 旧</option>
+        <option value="time-asc">时间：旧 → 新</option>
+        <option value="size-desc">体积：大 → 小</option>
+        <option value="size-asc">体积：小 → 大</option>
+      </select>
       <button class="plain" id="btn-reload">重新扫描文件目录</button>
       <span class="help" tabindex="0" aria-label="这一栏的口径">?<span class="tip">
         <div class="t-lead">这一栏的单位是<b>文件夹</b>，不是单个文件。</div>
         <div class="t-row"><span class="k">列出</span><span><code>/downloads</code> 下每个视频文件夹：体积、文件数</span></div>
         <div class="t-row"><span class="k">删除</span><span>整目录删掉 —— 视频、字幕、nfo、封面一起走，空目录也不留</span></div>
         <div class="t-row"><span class="k">记录</span><span>不动 <code>data.sqlite</code>；删完回「视频清单」那条会变「不存在」</span></div>
+        <div class="t-row"><span class="k">筛选</span><span>按下载目录分组，可只看某一个来源</span></div>
+        <div class="t-row"><span class="k">排序</span><span>按来源分组，或按「文件夹里最新那个文件」的时间、或按体积，排完不再分组</span></div>
         <div class="t-row"><span class="k">护栏</span><span>下载根目录、源目录本身及其上级一律拒删</span></div>
       </span></span>
       <span class="grow"></span>
@@ -290,12 +300,18 @@ function fmtSize(n){
   while(v>=1024 && i<u.length-1){ v/=1024; i++; }
   return (v>=100||i===0 ? Math.round(v) : v.toFixed(1)) + ' ' + u[i];
 }
+function fmtTime(t){
+  if(!t) return '';
+  const d = new Date(t*1000), p2 = (n) => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p2(d.getMonth()+1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
 const esc = (s) => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 let REC = { records: [], summary:{}, queue:{}, count:0 };
 let FILES = { groups: [], count:0, totalSize:0 };
 let fStatus = '', fGroup = '', fQuery = '';
 let qBucket = 'pending', qQuery = '';
+let fSrc = '', fSort = 'group';
 let diskTimer = null;
 
 /* ---------------- tab 切换 ---------------- */
@@ -395,8 +411,11 @@ function syncSel(){
 
   document.getElementById('sel-all').checked = lall.length > 0 && lsel.length === lall.length;
   document.getElementById('btn-del').disabled = lsel.length === 0;
+  const litems = fileItems();
   document.getElementById('loc-info').textContent =
-    `${FILES.count} 个视频文件夹 · 共 ${fmtSize(FILES.totalSize)}`;
+    fSrc
+      ? `${litems.length} / ${FILES.count} 个文件夹 · 共 ${fmtSize(litems.reduce((a,r) => a + r.it.size, 0))}`
+      : `${FILES.count} 个视频文件夹 · 共 ${fmtSize(FILES.totalSize)}`;
 
   const q = REC.queue || {};
   document.getElementById('dl-info').textContent =
@@ -429,32 +448,83 @@ async function queueAction(action){
 }
 
 /* ---------------- B：本地文件 ---------------- */
-function renderFiles(){
-  const box = document.getElementById('loc-list');
-  if(!FILES.groups.length){ box.innerHTML = '<div class="empty">下载目录里没扫到视频文件夹</div>'; return; }
-  box.innerHTML = FILES.groups.map((g, gi) => {
-    const sum = g.items.reduce((a,b) => a + b.size, 0);
-    return `<div class="group-head">
-        <label class="cb"><input type="checkbox" class="g-all" data-g="${gi}"></label>
-        <span class="g-name">${esc(g.group || '(根目录)')}</span>
-        <span>${g.items.length} 项 · ${fmtSize(sum)}</span>
-      </div>` + g.items.map(it => `
-      <div class="row">
+const SORTS = {
+  group:       () => 0,
+  'time-desc': (a,b) => b.mtime - a.mtime,
+  'time-asc':  (a,b) => a.mtime - b.mtime,
+  'size-desc': (a,b) => b.size - a.size,
+  'size-asc':  (a,b) => a.size - b.size
+};
+const SORT_NAME = { group:'按来源分组', 'time-desc':'时间：新 → 旧', 'time-asc':'时间：旧 → 新',
+                    'size-desc':'体积：大 → 小', 'size-asc':'体积：小 → 大' };
+
+/* 根目录那批（rel 里没有 /）没法用空串当值，给个哨兵 */
+const gkey = (g) => g || '\u0001root';
+
+/* 当前筛选下还剩哪些条目 */
+function fileItems(){
+  const out = [];
+  FILES.groups.forEach((g, gi) => {
+    if(fSrc && gkey(g.group) !== fSrc) return;
+    g.items.forEach(it => out.push({ it, gi }));
+  });
+  return out;
+}
+
+function fileRow(it, gi){
+  return `<div class="row">
         <label class="cb"><input type="checkbox" class="pick" value="${esc(it.abs)}" data-g="${gi}"></label>
         <div class="main">
           <div class="title">${esc(it.abs.split('/').pop())}</div>
-          <div class="meta ghost">${esc(it.rel)}</div>
+          <div class="meta ghost">${esc(it.rel)} · 最后修改 ${fmtTime(it.mtime)}</div>
         </div>
         <div class="right">${fmtSize(it.size)}<br><span class="ghost">${it.files} 个文件</span></div>
-      </div>`).join('');
-  }).join('');
+      </div>`;
+}
+
+function renderFiles(){
+  const box = document.getElementById('loc-list');
+  if(!FILES.groups.length){ box.innerHTML = '<div class="empty">下载目录里没扫到视频文件夹</div>'; syncSel(); return; }
+  const rows = fileItems();
+  if(!rows.length){ box.innerHTML = '<div class="empty">这个来源底下没有文件夹</div>'; syncSel(); return; }
+
+  if(fSort === 'group'){
+    let html = '';
+    FILES.groups.forEach((g, gi) => {
+      if(fSrc && gkey(g.group) !== fSrc) return;
+      const sum = g.items.reduce((a,b) => a + b.size, 0);
+      html += `<div class="group-head">
+          <label class="cb"><input type="checkbox" class="g-all" data-g="${gi}"></label>
+          <span class="g-name">${esc(g.group || '(根目录)')}</span>
+          <span>${g.items.length} 项 · ${fmtSize(sum)}</span>
+        </div>` + g.items.map(it => fileRow(it, gi)).join('');
+    });
+    box.innerHTML = html;
+  }else{
+    const items = rows.map(r => r.it).sort(SORTS[fSort]);
+    box.innerHTML = `<div class="group-head">
+          <label class="cb"><input type="checkbox" class="g-all" data-g="all"></label>
+          <span class="g-name">${SORT_NAME[fSort]}</span>
+          <span>${items.length} 项 · ${fmtSize(items.reduce((a,b) => a + b.size, 0))}</span>
+        </div>` + items.map(it => fileRow(it, '-')).join('');
+  }
 
   box.querySelectorAll('.g-all').forEach(cb => cb.onchange = () => {
-    box.querySelectorAll(`.pick[data-g="${cb.dataset.g}"]`).forEach(p => p.checked = cb.checked);
+    const sel = cb.dataset.g === 'all' ? '.pick' : `.pick[data-g="${cb.dataset.g}"]`;
+    box.querySelectorAll(sel).forEach(p => p.checked = cb.checked);
     syncSel();
   });
   box.querySelectorAll('.pick').forEach(cb => cb.onchange = syncSel);
   syncSel();
+}
+
+function fillLocSrc(){
+  const sel = document.getElementById('loc-src');
+  sel.innerHTML = [`<option value="">全部来源（${FILES.count}）</option>`].concat(
+    FILES.groups.map(g => `<option value="${esc(gkey(g.group))}">${esc(g.group || '(根目录)')}（${g.items.length}）</option>`)
+  ).join('');
+  sel.value = fSrc;
+  if(sel.value !== fSrc){ fSrc = ''; sel.value = ''; }   // 这个来源已经没了就回到全部
 }
 
 function picked(){
@@ -515,6 +585,7 @@ async function loadFiles(){
     const res = await (await fetch(api('/api/files'))).json();
     if(!res.ok){ box.innerHTML = `<div class="empty err">${esc(res.error || '扫描失败')}</div>`; return; }
     FILES = res;
+    fillLocSrc();
     renderFiles();
   }catch(e){
     box.innerHTML = `<div class="empty err">扫描失败：${esc(e)}</div>`;
@@ -541,6 +612,8 @@ async function loadDisk(){
 /* ---------------- 事件 ---------------- */
 document.getElementById('f-q').oninput = e => { fQuery = e.target.value; renderRecords(); };
 document.getElementById('f-group').onchange = e => { fGroup = e.target.value; renderRecords(); };
+document.getElementById('loc-src').onchange = e => { fSrc = e.target.value; renderFiles(); };
+document.getElementById('loc-sort').onchange = e => { fSort = e.target.value; renderFiles(); };
 document.getElementById('q-q').oninput = e => { qQuery = e.target.value; renderQueue(); };
 document.querySelectorAll('#f-status button').forEach(b => {
   b.title = b.dataset.s ? STATUS_DESC[b.dataset.s] : '不过滤';

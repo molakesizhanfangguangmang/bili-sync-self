@@ -1,0 +1,57 @@
+diff --git a/web/src/lib/components/app-sidebar.svelte b/web/src/lib/components/app-sidebar.svelte
+index 7045931..769e4d8 100644
+--- a/web/src/lib/components/app-sidebar.svelte
++++ b/web/src/lib/components/app-sidebar.svelte
+@@ -4,6 +4,7 @@
+ 	import DatabaseIcon from '@lucide/svelte/icons/database';
+ 	import FilePlayIcon from '@lucide/svelte/icons/file-play';
+ 	import FoldersIcon from '@lucide/svelte/icons/folders';
++	import HardDriveIcon from '@lucide/svelte/icons/hard-drive';
+ 	import HeartIcon from '@lucide/svelte/icons/heart';
+ 	import PaletteIcon from '@lucide/svelte/icons/palette';
+ 	import Settings2Icon from '@lucide/svelte/icons/settings-2';
+@@ -52,7 +53,12 @@
+ 						title: '视频源',
+ 						icon: DatabaseIcon,
+ 						href: '/video-sources'
+-					}
++					},
++					{
++						title: '存储',
++						icon: HardDriveIcon,
++						href: '/storage'
++					},
+ 				]
+ 			},
+ 			{
+diff --git a/web/src/routes/storage/+page.svelte b/web/src/routes/storage/+page.svelte
+new file mode 100644
+index 0000000..c236574
+--- /dev/null
++++ b/web/src/routes/storage/+page.svelte
+@@ -0,0 +1,25 @@
++<script lang="ts">
++	import { setBreadcrumb } from '$lib/stores/breadcrumb';
++	import { onMount } from 'svelte';
++
++	// steward（核盘 / 文件 / 下载列表）跑在同一个容器里，映射到宿主机 12346 端口。
++	// 用当前访问的主机名拼地址，从局域网 IP 或 localhost 打开都能用。
++	let src = '';
++
++	onMount(() => {
++		setBreadcrumb([{ label: '存储' }]);
++		src = `${location.protocol}//${location.hostname}:12346/`;
++	});
++</script>
++
++<svelte:head>
++	<title>存储 - Bili Sync</title>
++</svelte:head>
++
++{#if src}
++	<iframe
++		{src}
++		title="steward"
++		class="bg-background h-[calc(100vh-7rem)] w-full rounded-lg border"
++	></iframe>
++{/if}

@@ -379,7 +379,7 @@ index ff76d6c..3f8671a 100644
  
  export interface TaskStatus {
 diff --git a/web/src/routes/+page.svelte b/web/src/routes/+page.svelte
-index 9d360bf..9aed239 100644
+index 9d360bf..29dc2bb 100644
 --- a/web/src/routes/+page.svelte
 +++ b/web/src/routes/+page.svelte
 @@ -4,6 +4,9 @@
@@ -417,17 +417,17 @@ index 9d360bf..9aed239 100644
  	import UserIcon from '@lucide/svelte/icons/user';
  	import VideoIcon from '@lucide/svelte/icons/video';
  
-+	// 仪表盘的板块清单，顺序即默认顺序，span 是它在六列栅格里的占宽
++	// 仪表盘的板块清单，顺序即默认顺序；每块一样大，铺满一行再换行
 +	const ALL_BLOCKS = [
-+		{ id: 'disk', title: '存储空间', span: 'md:col-span-2' },
-+		{ id: 'sources', title: '当前监听', span: 'md:col-span-4' },
-+		{ id: 'recent', title: '最近入库', span: 'md:col-span-4' },
-+		{ id: 'task', title: '下载任务状态', span: 'md:col-span-2' },
-+		{ id: 'memory', title: '内存使用情况', span: 'md:col-span-3' },
-+		{ id: 'cpu', title: 'CPU 使用情况', span: 'md:col-span-3' },
-+		{ id: 'net', title: '网络速率', span: 'md:col-span-6' },
-+		{ id: 'queue', title: '下载队列', span: 'md:col-span-3' },
-+		{ id: 'library', title: '视频总账', span: 'md:col-span-3' }
++		{ id: 'disk', title: '存储空间' },
++		{ id: 'sources', title: '当前监听' },
++		{ id: 'recent', title: '最近入库' },
++		{ id: 'task', title: '下载任务状态' },
++		{ id: 'memory', title: '内存使用情况' },
++		{ id: 'cpu', title: 'CPU 使用情况' },
++		{ id: 'net', title: '网络速率' },
++		{ id: 'queue', title: '下载队列' },
++		{ id: 'library', title: '视频总账' }
 +	] as const;
 +	type BlockId = (typeof ALL_BLOCKS)[number]['id'];
 +	const DEFAULT_BLOCKS: BlockId[] = ALL_BLOCKS.map((block) => block.id);
@@ -651,10 +651,10 @@ index 9d360bf..9aed239 100644
 -								<div class="text-2xl font-bold">{formatBytes(sysInfo.available_disk)} 可用</div>
 -								<div class="text-muted-foreground text-sm">
 -									共 {formatBytes(sysInfo.total_disk)}
-+		<div class="grid gap-4 md:grid-cols-6">
++		<div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
 +			{#each visibleBlocks as block (block.id)}
 +				{#if block.id === 'disk'}
-+					<Card class={`max-w-full ${block.span}`}>
++					<Card class="max-w-full">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">存储空间</CardTitle>
 +							<HardDriveIcon class="text-muted-foreground h-4 w-4" />
@@ -702,7 +702,7 @@ index 9d360bf..9aed239 100644
 +						</CardContent>
 +					</Card>
 +				{:else if block.id === 'sources'}
-+					<Card class={`max-w-full ${block.span}`}>
++					<Card class="max-w-full">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">当前监听</CardTitle>
 +							<DatabaseIcon class="text-muted-foreground h-4 w-4" />
@@ -753,7 +753,7 @@ index 9d360bf..9aed239 100644
 +						</CardContent>
 +					</Card>
 +				{:else if block.id === 'recent'}
-+					<Card class={`max-w-full overflow-hidden ${block.span}`}>
++					<Card class="max-w-full overflow-hidden">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">最近入库</CardTitle>
 +							<VideoIcon class="text-muted-foreground h-4 w-4" />
@@ -816,7 +816,7 @@ index 9d360bf..9aed239 100644
 +						>
 +					</Card>
 +				{:else if block.id === 'task'}
-+					<Card class={`max-w-full ${block.span}`}>
++					<Card class="max-w-full">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">下载任务状态</CardTitle>
 +							<CloudDownloadIcon class="text-muted-foreground h-4 w-4" />
@@ -982,7 +982,7 @@ index 9d360bf..9aed239 100644
 +						</CardContent>
 +					</Card>
 +				{:else if block.id === 'memory'}
-+					<Card class={`overflow-hidden ${block.span}`}>
++					<Card class="overflow-hidden">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">内存使用情况</CardTitle>
 +							<MemoryStickIcon class="text-muted-foreground h-4 w-4" />
@@ -1051,7 +1051,7 @@ index 9d360bf..9aed239 100644
 +						</CardContent>
 +					</Card>
 +				{:else if block.id === 'cpu'}
-+					<Card class={`overflow-hidden ${block.span}`}>
++					<Card class="overflow-hidden">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">CPU 使用情况</CardTitle>
 +							<CpuIcon class="text-muted-foreground h-4 w-4" />
@@ -1118,7 +1118,7 @@ index 9d360bf..9aed239 100644
 +						</CardContent>
 +					</Card>
 +				{:else if block.id === 'net'}
-+					<Card class={`overflow-hidden ${block.span}`}>
++					<Card class="overflow-hidden">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">网络速率</CardTitle>
 +							<NetworkIcon class="text-muted-foreground h-4 w-4" />
@@ -1201,7 +1201,7 @@ index 9d360bf..9aed239 100644
 +						</CardContent>
 +					</Card>
 +				{:else if block.id === 'queue'}
-+					<Card class={`max-w-full ${block.span}`}>
++					<Card class="max-w-full">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">下载队列</CardTitle>
 +							<ListChecksIcon class="text-muted-foreground h-4 w-4" />
@@ -1253,7 +1253,7 @@ index 9d360bf..9aed239 100644
 +						</CardContent>
 +					</Card>
 +				{:else if block.id === 'library'}
-+					<Card class={`max-w-full ${block.span}`}>
++					<Card class="max-w-full">
 +						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
 +							<CardTitle class="text-sm font-medium">视频总账</CardTitle>
 +							<LibraryIcon class="text-muted-foreground h-4 w-4" />

@@ -1,3 +1,328 @@
+diff --git a/crates/bili_sync/src/api/response.rs b/crates/bili_sync/src/api/response.rs
+index 44ee854..8d3ad61 100644
+--- a/crates/bili_sync/src/api/response.rs
++++ b/crates/bili_sync/src/api/response.rs
+@@ -193,6 +193,16 @@ pub struct DashBoardResponse {
+     pub enabled_submissions: u64,
+     pub enable_watch_later: bool,
+     pub videos_by_day: Vec<DayCountPair>,
++    /// 待下载的视频数（有效且应该下载，但还没有下载完成）
++    pub queue_waiting: u64,
++    /// 已经下载完成的视频数
++    pub queue_downloaded: u64,
++    /// 被规则拦下、不打算下载的视频数
++    pub queue_skipped: u64,
++    /// 库里的视频总数
++    pub library_total: u64,
++    /// 已经失效的视频数
++    pub library_invalid: u64,
+ }
+ 
+ #[derive(Serialize, Clone, Copy)]
+@@ -205,6 +215,10 @@ pub struct SysInfo {
+     pub process_cpu: f32,
+     pub total_disk: u64,
+     pub available_disk: u64,
++    /// 距上次刷新之间收到的字节数换算出的速率（字节/秒）
++    pub net_rx_speed: u64,
++    /// 距上次刷新之间发出的字节数换算出的速率（字节/秒）
++    pub net_tx_speed: u64,
+ }
+ 
+ #[derive(Serialize, FromQueryResult)]
+diff --git a/crates/bili_sync/src/api/routes/dashboard/mod.rs b/crates/bili_sync/src/api/routes/dashboard/mod.rs
+index fac4f23..a4c6b27 100644
+--- a/crates/bili_sync/src/api/routes/dashboard/mod.rs
++++ b/crates/bili_sync/src/api/routes/dashboard/mod.rs
+@@ -4,6 +4,7 @@ use bili_sync_entity::*;
+ use sea_orm::entity::prelude::*;
+ use sea_orm::{FromQueryResult, Statement};
+ 
++use crate::api::request::{StatusFilter, ValidationFilter};
+ use crate::api::response::{DashBoardResponse, DayCountPair};
+ use crate::api::wrapper::{ApiError, ApiResponse};
+ 
+@@ -55,11 +56,38 @@ ORDER BY
+         ))
+         .all(&db),
+     )?;
++    // 下载队列与视频总账：直接复用视频列表那套筛选条件，保证口径一致
++    let (normal_count, skipped_count, invalid_count) = tokio::try_join!(
++        video::Entity::find()
++            .filter(ValidationFilter::Normal.to_video_query())
++            .count(&db),
++        video::Entity::find()
++            .filter(ValidationFilter::Skipped.to_video_query())
++            .count(&db),
++        video::Entity::find()
++            .filter(ValidationFilter::Invalid.to_video_query())
++            .count(&db),
++    )?;
++    let (queue_downloaded, queue_waiting) = tokio::try_join!(
++        video::Entity::find()
++            .filter(ValidationFilter::Normal.to_video_query())
++            .filter(StatusFilter::Succeeded.to_video_query())
++            .count(&db),
++        video::Entity::find()
++            .filter(ValidationFilter::Normal.to_video_query())
++            .filter(StatusFilter::Waiting.to_video_query())
++            .count(&db),
++    )?;
+     Ok(ApiResponse::ok(DashBoardResponse {
+         enabled_favorites,
+         enabled_collections,
+         enabled_submissions,
+         enable_watch_later: enabled_watch_later > 0,
+         videos_by_day,
++        queue_waiting,
++        queue_downloaded,
++        queue_skipped: skipped_count,
++        library_total: normal_count + skipped_count + invalid_count,
++        library_invalid: invalid_count,
+     }))
+ }
+diff --git a/crates/bili_sync/src/api/routes/dashboard_layout/mod.rs b/crates/bili_sync/src/api/routes/dashboard_layout/mod.rs
+new file mode 100644
+index 0000000..026ab3b
+--- /dev/null
++++ b/crates/bili_sync/src/api/routes/dashboard_layout/mod.rs
+@@ -0,0 +1,88 @@
++use std::collections::HashSet;
++use std::path::PathBuf;
++
++use anyhow::{Context, Result};
++use axum::Router;
++use axum::routing::get;
++use serde::{Deserialize, Serialize};
++use tracing::warn;
++use validator::Validate;
++
++use crate::api::error::InnerApiError;
++use crate::api::wrapper::{ApiError, ApiResponse, ValidatedJson};
++use crate::config::CONFIG_DIR;
++
++/// 仪表盘认得的板块 id，别的 id 一律拒绝
++pub const DASHBOARD_BLOCKS: [&str; 9] = [
++    "disk", "sources", "recent", "task", "memory", "cpu", "net", "queue", "library",
++];
++
++/// 没有配置文件时的默认板块与顺序
++const DEFAULT_BLOCKS: [&str; 9] = [
++    "disk", "sources", "recent", "task", "memory", "cpu", "net", "queue", "library",
++];
++
++/// 仪表盘板块配置，存在配置文件里，换浏览器仍然生效
++#[derive(Serialize, Deserialize, Clone, Validate)]
++pub struct DashboardLayout {
++    pub blocks: Vec<String>,
++}
++
++impl Default for DashboardLayout {
++    fn default() -> Self {
++        Self {
++            blocks: DEFAULT_BLOCKS.iter().map(|block| block.to_string()).collect(),
++        }
++    }
++}
++
++pub(super) fn router() -> Router {
++    Router::new().route("/dashboard-layout", get(get_layout).put(update_layout))
++}
++
++fn layout_path() -> PathBuf {
++    CONFIG_DIR.join("dashboard-layout.json")
++}
++
++async fn get_layout() -> Result<ApiResponse<DashboardLayout>, ApiError> {
++    Ok(ApiResponse::ok(load_layout().await?))
++}
++
++async fn update_layout(
++    ValidatedJson(layout): ValidatedJson<DashboardLayout>,
++) -> Result<ApiResponse<DashboardLayout>, ApiError> {
++    // 去重 + 去空白，顺带挡住不认识的板块 id
++    let mut seen = HashSet::new();
++    let blocks = layout
++        .blocks
++        .iter()
++        .map(|block| block.trim().to_owned())
++        .filter(|block| seen.insert(block.clone()))
++        .collect::<Vec<_>>();
++    if let Some(unknown) = blocks.iter().find(|block| !DASHBOARD_BLOCKS.contains(&block.as_str())) {
++        return Err(InnerApiError::BadRequest(format!("未知的仪表盘板块：{unknown}")).into());
++    }
++    let layout = DashboardLayout { blocks };
++    let path = layout_path();
++    let data = serde_json::to_vec_pretty(&layout).context("序列化仪表盘板块配置失败")?;
++    tokio::fs::write(&path, data)
++        .await
++        .with_context(|| format!("写入 {} 失败", path.display()))?;
++    Ok(ApiResponse::ok(layout))
++}
++
++async fn load_layout() -> Result<DashboardLayout> {
++    let path = layout_path();
++    match tokio::fs::read(&path).await {
++        Ok(data) => match serde_json::from_slice::<DashboardLayout>(&data) {
++            Ok(layout) => Ok(layout),
++            // 配置坏了不至于让仪表盘打不开，退回默认顺序
++            Err(e) => {
++                warn!("读取 {} 失败，改用默认板块：{e:?}", path.display());
++                Ok(DashboardLayout::default())
++            }
++        },
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DashboardLayout::default()),
++        Err(e) => Err(e).with_context(|| format!("读取 {} 失败", path.display())),
++    }
++}
+diff --git a/crates/bili_sync/src/api/routes/mod.rs b/crates/bili_sync/src/api/routes/mod.rs
+index 061bdd7..c188663 100644
+--- a/crates/bili_sync/src/api/routes/mod.rs
++++ b/crates/bili_sync/src/api/routes/mod.rs
+@@ -12,6 +12,7 @@ use crate::config::VersionedConfig;
+ 
+ mod config;
+ mod dashboard;
++mod dashboard_layout;
+ mod login;
+ mod me;
+ mod task;
+@@ -30,6 +31,7 @@ pub fn router() -> Router {
+             .merge(video_sources::router())
+             .merge(videos::router())
+             .merge(dashboard::router())
++            .merge(dashboard_layout::router())
+             .merge(ws::router())
+             .merge(task::router())
+             .layer(middleware::from_fn(auth)),
+diff --git a/crates/bili_sync/src/api/routes/ws/mod.rs b/crates/bili_sync/src/api/routes/ws/mod.rs
+index def0634..c50ab48 100644
+--- a/crates/bili_sync/src/api/routes/ws/mod.rs
++++ b/crates/bili_sync/src/api/routes/ws/mod.rs
+@@ -1,7 +1,7 @@
+ mod log_helper;
+ 
+ use std::sync::{Arc, LazyLock};
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use axum::extract::WebSocketUpgrade;
+ use axum::extract::ws::{Message, WebSocket};
+@@ -239,6 +239,8 @@ impl WebSocketHandler {
+                 let self_pid = get_current_pid().expect("Unsupported platform");
+                 let mut system = System::new();
+                 let mut disks = Disks::new();
++                // 上一次网卡累计字节数与时刻，用来算瞬时速率
++                let mut net_baseline: Option<(u64, u64, Instant)> = None;
+                 while tick_rx.blocking_recv().is_some() {
+                     system.refresh_needed(self_pid);
+                     disks.refresh_needed(self_pid);
+@@ -261,6 +263,7 @@ impl WebSocketHandler {
+                             total += d.total_space();
+                             (available, total)
+                         });
++                    let (net_rx_speed, net_tx_speed) = sample_net_speed(&mut net_baseline);
+                     let sys_info = SysInfo {
+                         timestamp: chrono::Utc::now().timestamp_millis(),
+                         total_memory: system.total_memory(),
+@@ -270,6 +273,8 @@ impl WebSocketHandler {
+                         process_cpu: process.cpu_usage() / system.cpus().len() as f32,
+                         total_disk: total,
+                         available_disk: available,
++                        net_rx_speed,
++                        net_tx_speed,
+                     };
+                     if tx.blocking_send(sys_info).is_err() {
+                         break;
+@@ -336,3 +341,52 @@ impl SysInfoExt for Disks {
+         self.refresh_specifics(true, DiskRefreshKind::nothing().with_storage());
+     }
+ }
++
++/// 采样网卡速率，返回（接收、发送）的字节/秒。
++/// 读 /proc/net/dev 里的累计字节数与上一次采样做差再除以间隔，回环网卡不计；
++/// 第一次调用只记基线，返回 (0, 0)。
++#[cfg(target_os = "linux")]
++fn sample_net_speed(baseline: &mut Option<(u64, u64, Instant)>) -> (u64, u64) {
++    let Ok(content) = std::fs::read_to_string("/proc/net/dev") else {
++        return (0, 0);
++    };
++    let (rx, tx) = content
++        .lines()
++        .skip(2) // 前两行是表头
++        .filter_map(|line| {
++            let (name, rest) = line.split_once(':')?;
++            if name.trim() == "lo" {
++                return None;
++            }
++            let mut fields = rest.split_whitespace();
++            let rx = fields.next()?.parse::<u64>().ok()?;
++            // 收包 8 个字段之后才是发包的字节数
++            let tx = fields.nth(7)?.parse::<u64>().ok()?;
++            Some((rx, tx))
++        })
++        .fold((0, 0), |(rx, tx), (item_rx, item_tx)| (rx + item_rx, tx + item_tx));
++    let now = Instant::now();
++    let speed = match baseline {
++        Some((last_rx, last_tx, last_at)) => {
++            let elapsed = now.duration_since(*last_at).as_secs_f64();
++            if elapsed <= 0.0 {
++                (0, 0)
++            } else {
++                (
++                    (rx.saturating_sub(*last_rx) as f64 / elapsed) as u64,
++                    (tx.saturating_sub(*last_tx) as f64 / elapsed) as u64,
++                )
++            }
++        }
++        None => (0, 0),
++    };
++    *baseline = Some((rx, tx, now));
++    speed
++}
++
++/// 非 linux 平台拿不到 /proc/net/dev，直接给 0
++#[cfg(not(target_os = "linux"))]
++fn sample_net_speed(baseline: &mut Option<(u64, u64, Instant)>) -> (u64, u64) {
++    let _ = baseline;
++    (0, 0)
++}
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 7e02098..4a604a5 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -5,6 +5,7 @@ import type {
+ 	CollectionsResponse,
+ 	Config,
+ 	DashBoardResponse,
++	DashboardLayout,
+ 	FavoritesResponse,
+ 	FullSyncVideoSourceRequest,
+ 	FullSyncVideoSourceResponse,
+@@ -283,6 +284,14 @@ class ApiClient {
+ 		return this.get<DashBoardResponse>('/dashboard');
+ 	}
+ 
++	async getDashboardLayout(): Promise<ApiResponse<DashboardLayout>> {
++		return this.get<DashboardLayout>('/dashboard-layout');
++	}
++
++	async updateDashboardLayout(layout: DashboardLayout): Promise<ApiResponse<DashboardLayout>> {
++		return this.put<DashboardLayout>('/dashboard-layout', layout);
++	}
++
+ 	async triggerDownloadTask(): Promise<ApiResponse<boolean>> {
+ 		return this.post<boolean>('/task/download');
+ 	}
+@@ -344,6 +353,8 @@ const api = {
+ 	getConfig: () => apiClient.getConfig(),
+ 	updateConfig: (config: Config) => apiClient.updateConfig(config),
+ 	getDashboard: () => apiClient.getDashboard(),
++	getDashboardLayout: () => apiClient.getDashboardLayout(),
++	updateDashboardLayout: (layout: DashboardLayout) => apiClient.updateDashboardLayout(layout),
+ 	triggerDownloadTask: () => apiClient.triggerDownloadTask(),
+ 	generateQrcode: () => apiClient.generateQrcode(),
+ 	pollQrcode: (qrcodeKey: string) => apiClient.pollQrcode(qrcodeKey),
 diff --git a/web/src/lib/components/app-sidebar.svelte b/web/src/lib/components/app-sidebar.svelte
 index 7045931..769e4d8 100644
 --- a/web/src/lib/components/app-sidebar.svelte
@@ -24,62 +349,1180 @@ index 7045931..769e4d8 100644
  				]
  			},
  			{
+diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
+index ff76d6c..3f8671a 100644
+--- a/web/src/lib/types.ts
++++ b/web/src/lib/types.ts
+@@ -384,6 +384,15 @@ export interface DashBoardResponse {
+ 	enabled_submissions: number;
+ 	enable_watch_later: boolean;
+ 	videos_by_day: DayCountPair[];
++	queue_waiting: number;
++	queue_downloaded: number;
++	queue_skipped: number;
++	library_total: number;
++	library_invalid: number;
++}
++
++export interface DashboardLayout {
++	blocks: string[];
+ }
+ 
+ export interface SysInfo {
+@@ -396,6 +405,8 @@ export interface SysInfo {
+ 	total_disk: number;
+ 	used_disk: number;
+ 	available_disk: number;
++	net_rx_speed: number;
++	net_tx_speed: number;
+ }
+ 
+ export interface TaskStatus {
 diff --git a/web/src/routes/+page.svelte b/web/src/routes/+page.svelte
-index 9d360bf..0fbcee4 100644
+index 9d360bf..9aed239 100644
 --- a/web/src/routes/+page.svelte
 +++ b/web/src/routes/+page.svelte
-@@ -164,6 +164,32 @@
+@@ -4,6 +4,9 @@
+ 	import { Progress } from '$lib/components/ui/progress/index.js';
+ 	import { Badge } from '$lib/components/ui/badge/index.js';
+ 	import { Button } from '$lib/components/ui/button/index.js';
++	import { Switch } from '$lib/components/ui/switch/index.js';
++	import { Label } from '$lib/components/ui/label/index.js';
++	import * as Dialog from '$lib/components/ui/dialog/index.js';
+ 	import * as Chart from '$lib/components/ui/chart/index.js';
+ 	import MyChartTooltip from '$lib/components/custom/my-chart-tooltip.svelte';
+ 	import { curveNatural } from 'd3-shape';
+@@ -14,7 +17,10 @@
+ 	import api from '$lib/api';
+ 	import type { DashBoardResponse, SysInfo, ApiError, TaskStatus } from '$lib/types';
+ 	import CalendarIcon from '@lucide/svelte/icons/calendar';
++	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
++	import ChevronUpIcon from '@lucide/svelte/icons/chevron-up';
+ 	import CircleCheckBigIcon from '@lucide/svelte/icons/circle-check-big';
++	import CircleXIcon from '@lucide/svelte/icons/circle-x';
+ 	import ClockIcon from '@lucide/svelte/icons/clock';
+ 	import CpuIcon from '@lucide/svelte/icons/cpu';
+ 	import DatabaseIcon from '@lucide/svelte/icons/database';
+@@ -22,11 +28,31 @@
+ 	import FolderIcon from '@lucide/svelte/icons/folder';
+ 	import HardDriveIcon from '@lucide/svelte/icons/hard-drive';
+ 	import HeartIcon from '@lucide/svelte/icons/heart';
++	import LibraryIcon from '@lucide/svelte/icons/library';
++	import ListChecksIcon from '@lucide/svelte/icons/list-checks';
+ 	import MemoryStickIcon from '@lucide/svelte/icons/memory-stick';
++	import NetworkIcon from '@lucide/svelte/icons/network';
+ 	import PlayIcon from '@lucide/svelte/icons/play';
++	import Settings2Icon from '@lucide/svelte/icons/settings-2';
++	import TriangleAlertIcon from '@lucide/svelte/icons/triangle-alert';
+ 	import UserIcon from '@lucide/svelte/icons/user';
+ 	import VideoIcon from '@lucide/svelte/icons/video';
+ 
++	// 仪表盘的板块清单，顺序即默认顺序，span 是它在六列栅格里的占宽
++	const ALL_BLOCKS = [
++		{ id: 'disk', title: '存储空间', span: 'md:col-span-2' },
++		{ id: 'sources', title: '当前监听', span: 'md:col-span-4' },
++		{ id: 'recent', title: '最近入库', span: 'md:col-span-4' },
++		{ id: 'task', title: '下载任务状态', span: 'md:col-span-2' },
++		{ id: 'memory', title: '内存使用情况', span: 'md:col-span-3' },
++		{ id: 'cpu', title: 'CPU 使用情况', span: 'md:col-span-3' },
++		{ id: 'net', title: '网络速率', span: 'md:col-span-6' },
++		{ id: 'queue', title: '下载队列', span: 'md:col-span-3' },
++		{ id: 'library', title: '视频总账', span: 'md:col-span-3' }
++	] as const;
++	type BlockId = (typeof ALL_BLOCKS)[number]['id'];
++	const DEFAULT_BLOCKS: BlockId[] = ALL_BLOCKS.map((block) => block.id);
++
+ 	let dashboardData = $state<DashBoardResponse | null>(null);
+ 	let sysInfo = $state<SysInfo | null>(null);
+ 	let taskStatus = $state<TaskStatus | null>(null);
+@@ -34,8 +60,41 @@
+ 	let triggering = $state(false);
+ 	let memoryHistory = $state<Array<{ time: number; used: number; process: number }>>([]);
+ 	let cpuHistory = $state<Array<{ time: number; used: number; process: number }>>([]);
++	let netHistory = $state<Array<{ time: number; rx: number; tx: number }>>([]);
++	let blocks = $state<BlockId[]>(DEFAULT_BLOCKS);
++	let editOpen = $state(false);
++	let draft = $state<BlockId[]>([]);
++	let saving = $state(false);
++	let wasRunning = false;
+ 	let unsubscribeSysInfo: (() => void) | null = null;
+ 	let unsubscribeTasks: (() => void) | null = null;
++	let refreshTimer: ReturnType<typeof setInterval> | null = null;
++
++	// 后端存的是板块 id 列表，这里只认自己认识的 id
++	function toBlockIds(ids: string[]): BlockId[] {
++		return ids.filter((id): id is BlockId => ALL_BLOCKS.some((block) => block.id === id));
++	}
++
++	function titleOf(id: BlockId): string {
++		return ALL_BLOCKS.find((block) => block.id === id)?.title ?? id;
++	}
++
++	const visibleBlocks = $derived(
++		blocks
++			.map((id) => ALL_BLOCKS.find((block) => block.id === id))
++			.filter((block): block is (typeof ALL_BLOCKS)[number] => Boolean(block))
++	);
++	const hiddenBlocks = $derived(
++		ALL_BLOCKS.filter((block) => !draft.includes(block.id)).map((block) => block.id)
++	);
++	const validCount = $derived(
++		dashboardData ? dashboardData.library_total - dashboardData.library_invalid : 0
++	);
++	const validPercent = $derived(
++		dashboardData && dashboardData.library_total > 0
++			? (validCount / dashboardData.library_total) * 100
++			: 0
++	);
+ 
+ 	function formatBytes(bytes: number): string {
+ 		if (bytes === 0) return '0 B';
+@@ -45,6 +104,10 @@
+ 		return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+ 	}
+ 
++	function formatSpeed(bytes: number): string {
++		return `${formatBytes(bytes)}/s`;
++	}
++
+ 	function formatCpu(cpu: number): string {
+ 		return `${cpu.toFixed(1)}%`;
+ 	}
+@@ -58,18 +121,68 @@
+ 		});
+ 	}
+ 
+-	async function loadDashboard() {
+-		loading = true;
++	// background 为真时不切 loading，也不弹提示，供定时刷新用
++	async function loadDashboard(background = false) {
++		if (!background) loading = true;
+ 		try {
+ 			const response = await api.getDashboard();
+ 			dashboardData = response.data;
+ 		} catch (error) {
+ 			console.error('加载仪表盘数据失败：', error);
+-			toast.error('加载仪表盘数据失败', {
++			if (!background) {
++				toast.error('加载仪表盘数据失败', {
++					description: (error as ApiError).message
++				});
++			}
++		} finally {
++			if (!background) loading = false;
++		}
++	}
++
++	async function loadLayout() {
++		try {
++			const response = await api.getDashboardLayout();
++			blocks = toBlockIds(response.data?.blocks ?? []);
++		} catch (error) {
++			console.error('加载板块设置失败：', error);
++		}
++	}
++
++	function openEdit() {
++		draft = [...blocks];
++		editOpen = true;
++	}
++
++	function toggleBlock(id: BlockId, checked: boolean) {
++		if (checked) {
++			if (!draft.includes(id)) draft = [...draft, id];
++		} else {
++			draft = draft.filter((item) => item !== id);
++		}
++	}
++
++	function moveBlock(index: number, offset: number) {
++		const target = index + offset;
++		if (target < 0 || target >= draft.length) return;
++		const next = [...draft];
++		[next[index], next[target]] = [next[target], next[index]];
++		draft = next;
++	}
++
++	async function saveLayout() {
++		saving = true;
++		try {
++			const response = await api.updateDashboardLayout({ blocks: draft });
++			blocks = toBlockIds(response.data?.blocks ?? draft);
++			editOpen = false;
++			toast.success('板块设置已保存');
++		} catch (error) {
++			console.error('保存板块设置失败：', error);
++			toast.error('保存板块设置失败', {
+ 				description: (error as ApiError).message
+ 			});
+ 		} finally {
+-			loading = false;
++			saving = false;
+ 		}
+ 	}
+ 
+@@ -119,6 +232,17 @@
+ 		}
+ 	} satisfies Chart.ChartConfig;
+ 
++	const netChartConfig = {
++		rx: {
++			label: '下行',
++			color: 'var(--primary)'
++		},
++		tx: {
++			label: '上行',
++			color: 'oklch(from var(--primary) calc(l * 0.6) c h)'
++		}
++	} satisfies Chart.ChartConfig;
++
+ 	function pushSysInfo(data: SysInfo) {
+ 		memoryHistory = [
+ 			...memoryHistory.slice(-14),
+@@ -136,6 +260,14 @@
+ 				process: data.process_cpu
  			}
+ 		];
++		netHistory = [
++			...netHistory.slice(-14),
++			{
++				time: data.timestamp,
++				rx: data.net_rx_speed ?? 0,
++				tx: data.net_tx_speed ?? 0
++			}
++		];
+ 	}
+ 
+ 	const diskUsagePercent = $derived(
+@@ -151,8 +283,15 @@
+ 		});
+ 		unsubscribeTasks = api.subscribeToTasks((data: TaskStatus) => {
+ 			taskStatus = data;
++			// 一轮下载任务跑完时队列数字会变，顺手刷新一次
++			if (wasRunning && !data.is_running) {
++				loadDashboard(true);
++			}
++			wasRunning = data.is_running;
+ 		});
++		loadLayout();
+ 		loadDashboard();
++		refreshTimer = setInterval(() => loadDashboard(true), 60000);
+ 		return () => {
+ 			if (unsubscribeSysInfo) {
+ 				unsubscribeSysInfo();
+@@ -162,6 +301,10 @@
+ 				unsubscribeTasks();
+ 				unsubscribeTasks = null;
+ 			}
++			if (refreshTimer) {
++				clearInterval(refreshTimer);
++				refreshTimer = null;
++			}
  		};
  	});
-+	// 管家（steward）跑在同一个容器里，宿主映射 12346，首页只嵌它的概览那几块。
-+	// iframe 是另一个源，读不到本页的主题，所以把当前明暗当查询参数带过去；
-+	// embed=1 让管家只渲染概览块（标题 / tab / 页脚都收起来）。
-+	let stewardSrc = $state('');
-+	let stewardHeight = $state(460);
-+	onMount(() => {
-+		const theme = () => (document.documentElement.classList.contains('dark') ? 'dark' : 'light');
-+		const origin = () => `${location.protocol}//${location.hostname}:12346`;
-+		const url = () => `${origin()}/?embed=1&theme=${theme()}`;
-+		stewardSrc = url();
-+		const observer = new MutationObserver(() => {
-+			stewardSrc = url();
-+		});
-+		observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
-+		// 块的高度不固定（块可增删、数字会变行），让管家自己量好之后 postMessage 过来
-+		const onMessage = (e: MessageEvent) => {
-+			if (e.origin !== origin()) return;
-+			const h = Number((e.data as { height?: number })?.height) || 0;
-+			if (h > 120) stewardHeight = Math.min(Math.round(h), 1400);
-+		};
-+		window.addEventListener('message', onMessage);
-+		return () => {
-+			observer.disconnect();
-+			window.removeEventListener('message', onMessage);
-+		};
-+	});
  </script>
- 
- <svelte:head>
-@@ -171,6 +197,18 @@
+@@ -171,358 +314,572 @@
  </svelte:head>
  
  <div class="space-y-6">
-+	<div class="space-y-3">
-+		<div class="text-muted-foreground text-sm font-medium">管家 · 概览</div>
-+		{#if stewardSrc}
-+			<iframe
-+				src={stewardSrc}
-+				title="steward"
-+				style={`height:${stewardHeight}px`}
-+				class="bg-background w-full rounded-lg border"
-+			></iframe>
-+		{/if}
++	<div class="flex items-center justify-between">
++		<div class="text-muted-foreground text-sm">共 {visibleBlocks.length} 个板块</div>
++		<Button variant="outline" size="sm" onclick={openEdit}>
++			<Settings2Icon class="h-4 w-4" />
++			编辑板块
++		</Button>
 +	</div>
 +
  	{#if loading}
  		<div class="flex items-center justify-center py-12">
  			<div class="text-muted-foreground">加载中...</div>
+ 		</div>
+ 	{:else}
+-		<div class="grid gap-4 md:grid-cols-3">
+-			<Card class="md:col-span-1">
+-				<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
+-					<CardTitle class="text-sm font-medium">存储空间</CardTitle>
+-					<HardDriveIcon class="text-muted-foreground h-4 w-4" />
+-				</CardHeader>
+-				<CardContent>
+-					{#if sysInfo}
+-						<div class="space-y-2">
+-							<div class="flex items-center justify-between">
+-								<div class="text-2xl font-bold">{formatBytes(sysInfo.available_disk)} 可用</div>
+-								<div class="text-muted-foreground text-sm">
+-									共 {formatBytes(sysInfo.total_disk)}
++		<div class="grid gap-4 md:grid-cols-6">
++			{#each visibleBlocks as block (block.id)}
++				{#if block.id === 'disk'}
++					<Card class={`max-w-full ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">存储空间</CardTitle>
++							<HardDriveIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if sysInfo}
++								<div class="space-y-2">
++									<div class="flex items-center justify-between">
++										<div class="text-2xl font-bold">{formatBytes(sysInfo.available_disk)} 可用</div>
++										<div class="text-muted-foreground text-sm">
++											共 {formatBytes(sysInfo.total_disk)}
++										</div>
++									</div>
++									<Progress value={diskUsagePercent} class="h-2" />
++									<div class="text-muted-foreground text-xs">
++										已使用 {diskUsagePercent.toFixed(1)}% 的存储空间
++									</div>
+ 								</div>
+-							</div>
+-							<Progress value={diskUsagePercent} class="h-2" />
+-							<div class="text-muted-foreground text-xs">
+-								已使用 {diskUsagePercent.toFixed(1)}% 的存储空间
+-							</div>
+-						</div>
+-					{:else}
+-						<div class="text-muted-foreground text-sm">加载中...</div>
+-					{/if}
+-				</CardContent>
+-			</Card>
+-			<Card class="md:col-span-2">
+-				<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
+-					<CardTitle class="text-sm font-medium">当前监听</CardTitle>
+-					<DatabaseIcon class="text-muted-foreground h-4 w-4" />
+-				</CardHeader>
+-				<CardContent>
+-					{#if dashboardData}
+-						<div class="grid grid-cols-2 gap-4">
+-							<div class="flex items-center justify-between">
+-								<div class="flex items-center gap-2">
+-									<HeartIcon class="text-muted-foreground h-4 w-4" />
+-									<span class="text-sm">收藏夹</span>
++							{:else}
++								<div class="text-muted-foreground text-sm">加载中...</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{:else if block.id === 'sources'}
++					<Card class={`max-w-full ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">当前监听</CardTitle>
++							<DatabaseIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if dashboardData}
++								<div class="grid grid-cols-2 gap-4">
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<HeartIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">收藏夹</span>
++										</div>
++										<Badge variant="outline">{dashboardData.enabled_favorites}</Badge>
++									</div>
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<FolderIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">合集 / 列表</span>
++										</div>
++										<Badge variant="outline">{dashboardData.enabled_collections}</Badge>
++									</div>
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<UserIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">投稿</span>
++										</div>
++										<Badge variant="outline">{dashboardData.enabled_submissions}</Badge>
++									</div>
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<ClockIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">稍后再看</span>
++										</div>
++										<Badge variant="outline">
++											{dashboardData.enable_watch_later ? '启用' : '禁用'}
++										</Badge>
++									</div>
+ 								</div>
+-								<Badge variant="outline">{dashboardData.enabled_favorites}</Badge>
+-							</div>
+-							<div class="flex items-center justify-between">
+-								<div class="flex items-center gap-2">
+-									<FolderIcon class="text-muted-foreground h-4 w-4" />
+-									<span class="text-sm">合集 / 列表</span>
++							{:else}
++								<div class="text-muted-foreground text-sm">加载中...</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{:else if block.id === 'recent'}
++					<Card class={`max-w-full overflow-hidden ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">最近入库</CardTitle>
++							<VideoIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if dashboardData && dashboardData.videos_by_day.length > 0}
++								<div class="mb-4 space-y-2">
++									<div class="flex items-center justify-between text-sm">
++										<span>近七日新增视频</span>
++										<span class="font-medium"
++											>{dashboardData.videos_by_day.reduce((sum, v) => sum + v.cnt, 0)} 个</span
++										>
++									</div>
+ 								</div>
+-								<Badge variant="outline">{dashboardData.enabled_collections}</Badge>
+-							</div>
+-							<div class="flex items-center justify-between">
+-								<div class="flex items-center gap-2">
+-									<UserIcon class="text-muted-foreground h-4 w-4" />
+-									<span class="text-sm">投稿</span>
++								<Chart.Container config={videoChartConfig} class="h-[200px] w-full">
++									<BarChart
++										data={dashboardData.videos_by_day}
++										x="day"
++										axis="x"
++										series={[
++											{
++												key: 'cnt',
++												label: '新增视频',
++												color: videoChartConfig.videos.color
++											}
++										]}
++										props={{
++											bars: {
++												stroke: 'none',
++												rounded: 'all',
++												radius: 8,
++												initialHeight: 0
++											},
++											highlight: { area: { fill: 'none' } },
++											xAxis: { format: () => '' }
++										}}
++									>
++										{#snippet tooltip({ context })}
++											<MyChartTooltip {context} indicator="line" />
++										{/snippet}
++									</BarChart>
++								</Chart.Container>
++							{:else}
++								<div class="text-muted-foreground flex h-[200px] items-center justify-center text-sm">
++									暂无视频统计数据
+ 								</div>
+-								<Badge variant="outline">{dashboardData.enabled_submissions}</Badge>
+-							</div>
+-							<div class="flex items-center justify-between">
+-								<div class="flex items-center gap-2">
+-									<ClockIcon class="text-muted-foreground h-4 w-4" />
+-									<span class="text-sm">稍后再看</span>
++							{/if}</CardContent
++						>
++					</Card>
++				{:else if block.id === 'task'}
++					<Card class={`max-w-full ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">下载任务状态</CardTitle>
++							<CloudDownloadIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if taskStatus}
++								<div class="space-y-4">
++									<div class="grid grid-cols-1 gap-6">
++										<div class="mb-4 space-y-2">
++											<div class="flex items-center justify-between text-sm">
++												<span>当前任务状态</span>
++												<Badge variant={taskStatus.is_running ? 'default' : 'outline'}>
++													{taskStatus.is_running ? '运行中' : '未运行'}
++												</Badge>
++											</div>
++										</div>
++										<div class="flex items-center justify-between">
++											<div class="flex items-center gap-2">
++												<PlayIcon class="text-muted-foreground h-4 w-4" />
++												<span class="text-sm">开始运行</span>
++											</div>
++											<span class="text-muted-foreground text-sm">
++												{taskStatus.last_run
++													? new Date(taskStatus.last_run).toLocaleString('en-US', {
++															month: '2-digit',
++															day: '2-digit',
++															hour: '2-digit',
++															minute: '2-digit',
++															second: '2-digit',
++															hour12: true
++														})
++													: '-'}
++											</span>
++										</div>
++										<div class="flex items-center justify-between">
++											<div class="flex items-center gap-2">
++												<CircleCheckBigIcon class="text-muted-foreground h-4 w-4" />
++												<span class="text-sm">运行结束</span>
++											</div>
++											<span class="text-muted-foreground text-sm">
++												{taskStatus.last_finish
++													? new Date(taskStatus.last_finish).toLocaleString('en-US', {
++															month: '2-digit',
++															day: '2-digit',
++															hour: '2-digit',
++															minute: '2-digit',
++															second: '2-digit',
++															hour12: true
++														})
++													: '-'}
++											</span>
++										</div>
++										<div class="flex items-center justify-between">
++											<div class="flex items-center gap-2">
++												<CalendarIcon class="text-muted-foreground h-4 w-4" />
++												<span class="text-sm">下次运行</span>
++											</div>
++											<span class="text-muted-foreground text-sm">
++												{taskStatus.next_run
++													? new Date(taskStatus.next_run).toLocaleString('en-US', {
++															month: '2-digit',
++															day: '2-digit',
++															hour: '2-digit',
++															minute: '2-digit',
++															second: '2-digit',
++															hour12: true
++														})
++													: '-'}
++											</span>
++										</div>
++									</div>
++									<div class="mt-6 border-t pt-4">
++										<Button
++											class="w-full"
++											size="sm"
++											onclick={handleTriggerDownload}
++											disabled={triggering || (taskStatus?.is_running ?? false)}
++										>
++											<DownloadIcon class="h-4 w-4" />
++											{triggering
++												? '触发中...'
++												: taskStatus?.is_running
++													? '任务运行中'
++													: '立即执行下载任务'}
++										</Button>
++									</div>
+ 								</div>
+-								<Badge variant="outline">
+-									{dashboardData.enable_watch_later ? '启用' : '禁用'}
+-								</Badge>
+-							</div>
+-						</div>
+-					{:else}
+-						<div class="text-muted-foreground text-sm">加载中...</div>
+-					{/if}
+-				</CardContent>
+-			</Card>
+-		</div>
+-
+-		<div class="grid gap-4 md:grid-cols-3">
+-			<Card class="max-w-full overflow-hidden md:col-span-2">
+-				<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
+-					<CardTitle class="text-sm font-medium">最近入库</CardTitle>
+-					<VideoIcon class="text-muted-foreground h-4 w-4" />
+-				</CardHeader>
+-				<CardContent>
+-					{#if dashboardData && dashboardData.videos_by_day.length > 0}
+-						<div class="mb-4 space-y-2">
+-							<div class="flex items-center justify-between text-sm">
+-								<span>近七日新增视频</span>
+-								<span class="font-medium"
+-									>{dashboardData.videos_by_day.reduce((sum, v) => sum + v.cnt, 0)} 个</span
+-								>
+-							</div>
+-						</div>
+-						<Chart.Container config={videoChartConfig} class="h-[200px] w-full">
+-							<BarChart
+-								data={dashboardData.videos_by_day}
+-								x="day"
+-								axis="x"
+-								series={[
+-									{
+-										key: 'cnt',
+-										label: '新增视频',
+-										color: videoChartConfig.videos.color
+-									}
+-								]}
+-								props={{
+-									bars: {
+-										stroke: 'none',
+-										rounded: 'all',
+-										radius: 8,
+-										initialHeight: 0
+-									},
+-									highlight: { area: { fill: 'none' } },
+-									xAxis: { format: () => '' }
+-								}}
+-							>
+-								{#snippet tooltip({ context })}
+-									<MyChartTooltip {context} indicator="line" />
+-								{/snippet}
+-							</BarChart>
+-						</Chart.Container>
+-					{:else}
+-						<div class="text-muted-foreground flex h-[200px] items-center justify-center text-sm">
+-							暂无视频统计数据
+-						</div>
+-					{/if}</CardContent
+-				>
+-			</Card>
+-			<Card class="max-w-full md:col-span-1">
+-				<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
+-					<CardTitle class="text-sm font-medium">下载任务状态</CardTitle>
+-					<CloudDownloadIcon class="text-muted-foreground h-4 w-4" />
+-				</CardHeader>
+-				<CardContent>
+-					{#if taskStatus}
+-						<div class="space-y-4">
+-							<div class="grid grid-cols-1 gap-6">
++							{:else}
++								<div class="text-muted-foreground text-sm">加载中...</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{:else if block.id === 'memory'}
++					<Card class={`overflow-hidden ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">内存使用情况</CardTitle>
++							<MemoryStickIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if sysInfo}
+ 								<div class="mb-4 space-y-2">
+ 									<div class="flex items-center justify-between text-sm">
+-										<span>当前任务状态</span>
+-										<Badge variant={taskStatus.is_running ? 'default' : 'outline'}>
+-											{taskStatus.is_running ? '运行中' : '未运行'}
+-										</Badge>
++										<span>当前内存使用</span>
++										<span class="font-medium"
++											>{formatBytes(sysInfo.used_memory)} / {formatBytes(sysInfo.total_memory)}</span
++										>
++									</div>
++								</div>
++							{/if}
++							{#if memoryHistory.length > 0}
++								<Chart.Container config={memoryChartConfig} class="h-[150px] w-full">
++									<AreaChart
++										data={memoryHistory}
++										x="time"
++										axis="x"
++										series={[
++											{
++												key: 'used',
++												label: memoryChartConfig.used.label,
++												color: memoryChartConfig.used.color
++											},
++											{
++												key: 'process',
++												label: memoryChartConfig.process.label,
++												color: memoryChartConfig.process.color
++											}
++										]}
++										props={{
++											area: {
++												curve: curveNatural,
++												line: { class: 'stroke-1' },
++												'fill-opacity': 0.4
++											},
++											xAxis: {
++												format: () => ''
++											}
++										}}
++									>
++										{#snippet tooltip({ context })}
++											<MyChartTooltip
++												{context}
++												labelFormatter={(timestamp: number) => {
++													return formatTimestamp(timestamp);
++												}}
++												valueFormatter={(v: number) => formatBytes(v)}
++												indicator="line"
++											/>
++										{/snippet}
++									</AreaChart>
++								</Chart.Container>
++							{:else}
++								<div class="text-muted-foreground flex h-[150px] items-center justify-center text-sm">
++									等待数据...
++								</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{:else if block.id === 'cpu'}
++					<Card class={`overflow-hidden ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">CPU 使用情况</CardTitle>
++							<CpuIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent class="overflow-hidden">
++							{#if sysInfo}
++								<div class="mb-4 space-y-2">
++									<div class="flex items-center justify-between text-sm">
++										<span>当前 CPU 使用率</span>
++										<span class="font-medium">{formatCpu(sysInfo.used_cpu)}</span>
+ 									</div>
+ 								</div>
+-								<div class="flex items-center justify-between">
+-									<div class="flex items-center gap-2">
+-										<PlayIcon class="text-muted-foreground h-4 w-4" />
+-										<span class="text-sm">开始运行</span>
++							{/if}
++							{#if cpuHistory.length > 0}
++								<Chart.Container config={cpuChartConfig} class="h-[150px] w-full">
++									<AreaChart
++										data={cpuHistory}
++										x="time"
++										axis="x"
++										series={[
++											{
++												key: 'used',
++												label: cpuChartConfig.used.label,
++												color: cpuChartConfig.used.color
++											},
++											{
++												key: 'process',
++												label: cpuChartConfig.process.label,
++												color: cpuChartConfig.process.color
++											}
++										]}
++										props={{
++											area: {
++												curve: curveNatural,
++												line: { class: 'stroke-1' },
++												'fill-opacity': 0.4
++											},
++											xAxis: {
++												format: () => ''
++											}
++										}}
++									>
++										{#snippet tooltip({ context })}
++											<MyChartTooltip
++												{context}
++												labelFormatter={(timestamp: number) => {
++													return formatTimestamp(timestamp);
++												}}
++												valueFormatter={(v: number) => formatCpu(v)}
++												indicator="line"
++											/>
++										{/snippet}
++									</AreaChart>
++								</Chart.Container>
++							{:else}
++								<div class="text-muted-foreground flex h-[150px] items-center justify-center text-sm">
++									等待数据...
++								</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{:else if block.id === 'net'}
++					<Card class={`overflow-hidden ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">网络速率</CardTitle>
++							<NetworkIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if sysInfo}
++								<div class="mb-4 grid grid-cols-2 gap-4">
++									<div class="flex items-center justify-between text-sm">
++										<span>下行</span>
++										<span class="font-medium">{formatSpeed(sysInfo.net_rx_speed ?? 0)}</span>
++									</div>
++									<div class="flex items-center justify-between text-sm">
++										<span>上行</span>
++										<span class="font-medium">{formatSpeed(sysInfo.net_tx_speed ?? 0)}</span>
+ 									</div>
+-									<span class="text-muted-foreground text-sm">
+-										{taskStatus.last_run
+-											? new Date(taskStatus.last_run).toLocaleString('en-US', {
+-													month: '2-digit',
+-													day: '2-digit',
+-													hour: '2-digit',
+-													minute: '2-digit',
+-													second: '2-digit',
+-													hour12: true
+-												})
+-											: '-'}
+-									</span>
+ 								</div>
+-								<div class="flex items-center justify-between">
+-									<div class="flex items-center gap-2">
+-										<CircleCheckBigIcon class="text-muted-foreground h-4 w-4" />
+-										<span class="text-sm">运行结束</span>
++							{/if}
++							{#if netHistory.length > 0}
++								<Chart.Container config={netChartConfig} class="h-[150px] w-full">
++									<AreaChart
++										data={netHistory}
++										x="time"
++										axis="x"
++										series={[
++											{
++												key: 'rx',
++												label: netChartConfig.rx.label,
++												color: netChartConfig.rx.color
++											},
++											{
++												key: 'tx',
++												label: netChartConfig.tx.label,
++												color: netChartConfig.tx.color
++											}
++										]}
++										props={{
++											area: {
++												curve: curveNatural,
++												line: { class: 'stroke-1' },
++												'fill-opacity': 0.4
++											},
++											xAxis: {
++												format: () => ''
++											}
++										}}
++									>
++										{#snippet tooltip({ context })}
++											<MyChartTooltip
++												{context}
++												labelFormatter={(timestamp: number) => {
++													return formatTimestamp(timestamp);
++												}}
++												valueFormatter={(v: number) => formatSpeed(v)}
++												indicator="line"
++											/>
++										{/snippet}
++									</AreaChart>
++								</Chart.Container>
++							{:else}
++								<div class="text-muted-foreground flex h-[150px] items-center justify-center text-sm">
++									等待数据...
++								</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{:else if block.id === 'queue'}
++					<Card class={`max-w-full ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">下载队列</CardTitle>
++							<ListChecksIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if dashboardData}
++								<div class="space-y-4">
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<ClockIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">待下载</span>
++										</div>
++										<Badge variant="outline">{dashboardData.queue_waiting}</Badge>
++									</div>
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<CircleCheckBigIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">已下载</span>
++										</div>
++										<Badge variant="outline">{dashboardData.queue_downloaded}</Badge>
++									</div>
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<CircleXIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">不下</span>
++										</div>
++										<Badge variant="outline">{dashboardData.queue_skipped}</Badge>
+ 									</div>
+-									<span class="text-muted-foreground text-sm">
+-										{taskStatus.last_finish
+-											? new Date(taskStatus.last_finish).toLocaleString('en-US', {
+-													month: '2-digit',
+-													day: '2-digit',
+-													hour: '2-digit',
+-													minute: '2-digit',
+-													second: '2-digit',
+-													hour12: true
+-												})
+-											: '-'}
+-									</span>
+ 								</div>
+-								<div class="flex items-center justify-between">
+-									<div class="flex items-center gap-2">
+-										<CalendarIcon class="text-muted-foreground h-4 w-4" />
+-										<span class="text-sm">下次运行</span>
++							{:else}
++								<div class="text-muted-foreground text-sm">加载中...</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{:else if block.id === 'library'}
++					<Card class={`max-w-full ${block.span}`}>
++						<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
++							<CardTitle class="text-sm font-medium">视频总账</CardTitle>
++							<LibraryIcon class="text-muted-foreground h-4 w-4" />
++						</CardHeader>
++						<CardContent>
++							{#if dashboardData}
++								<div class="space-y-4">
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<VideoIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">视频总数</span>
++										</div>
++										<Badge variant="outline">{dashboardData.library_total}</Badge>
++									</div>
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<CircleCheckBigIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">有效</span>
++										</div>
++										<Badge variant="outline">{validCount}</Badge>
++									</div>
++									<div class="flex items-center justify-between">
++										<div class="flex items-center gap-2">
++											<TriangleAlertIcon class="text-muted-foreground h-4 w-4" />
++											<span class="text-sm">失效</span>
++										</div>
++										<Badge variant="outline">{dashboardData.library_invalid}</Badge>
++									</div>
++									<div class="space-y-2 pt-2">
++										<Progress value={validPercent} class="h-2" />
++										<div class="text-muted-foreground text-xs">
++											有效 {validPercent.toFixed(1)}% 的视频
++										</div>
+ 									</div>
+-									<span class="text-muted-foreground text-sm">
+-										{taskStatus.next_run
+-											? new Date(taskStatus.next_run).toLocaleString('en-US', {
+-													month: '2-digit',
+-													day: '2-digit',
+-													hour: '2-digit',
+-													minute: '2-digit',
+-													second: '2-digit',
+-													hour12: true
+-												})
+-											: '-'}
+-									</span>
+ 								</div>
+-							</div>
+-							<div class="mt-6 border-t pt-4">
+-								<Button
+-									class="w-full"
+-									size="sm"
+-									onclick={handleTriggerDownload}
+-									disabled={triggering || (taskStatus?.is_running ?? false)}
+-								>
+-									<DownloadIcon class="h-4 w-4" />
+-									{triggering
+-										? '触发中...'
+-										: taskStatus?.is_running
+-											? '任务运行中'
+-											: '立即执行下载任务'}
+-								</Button>
+-							</div>
+-						</div>
+-					{:else}
+-						<div class="text-muted-foreground text-sm">加载中...</div>
+-					{/if}
+-				</CardContent>
+-			</Card>
++							{:else}
++								<div class="text-muted-foreground text-sm">加载中...</div>
++							{/if}
++						</CardContent>
++					</Card>
++				{/if}
++			{/each}
+ 		</div>
++	{/if}
++</div>
+ 
+-		<!-- 第三行：系统监控 -->
+-		<div class="grid gap-4 md:grid-cols-2">
+-			<!-- 内存使用情况 -->
+-			<Card class="overflow-hidden">
+-				<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
+-					<CardTitle class="text-sm font-medium">内存使用情况</CardTitle>
+-					<MemoryStickIcon class="text-muted-foreground h-4 w-4" />
+-				</CardHeader>
+-				<CardContent>
+-					{#if sysInfo}
+-						<div class="mb-4 space-y-2">
+-							<div class="flex items-center justify-between text-sm">
+-								<span>当前内存使用</span>
+-								<span class="font-medium"
+-									>{formatBytes(sysInfo.used_memory)} / {formatBytes(sysInfo.total_memory)}</span
+-								>
+-							</div>
+-						</div>
+-					{/if}
+-					{#if memoryHistory.length > 0}
+-						<Chart.Container config={memoryChartConfig} class="h-[150px] w-full">
+-							<AreaChart
+-								data={memoryHistory}
+-								x="time"
+-								axis="x"
+-								series={[
+-									{
+-										key: 'used',
+-										label: memoryChartConfig.used.label,
+-										color: memoryChartConfig.used.color
+-									},
+-									{
+-										key: 'process',
+-										label: memoryChartConfig.process.label,
+-										color: memoryChartConfig.process.color
+-									}
+-								]}
+-								props={{
+-									area: {
+-										curve: curveNatural,
+-										line: { class: 'stroke-1' },
+-										'fill-opacity': 0.4
+-									},
+-									xAxis: {
+-										format: () => ''
+-									}
+-								}}
+-							>
+-								{#snippet tooltip({ context })}
+-									<MyChartTooltip
+-										{context}
+-										labelFormatter={(timestamp: number) => {
+-											return formatTimestamp(timestamp);
+-										}}
+-										valueFormatter={(v: number) => formatBytes(v)}
+-										indicator="line"
+-									/>
+-								{/snippet}
+-							</AreaChart>
+-						</Chart.Container>
+-					{:else}
+-						<div class="text-muted-foreground flex h-[200px] items-center justify-center text-sm">
+-							等待数据...
+-						</div>
+-					{/if}
+-				</CardContent>
+-			</Card>
++<Dialog.Root bind:open={editOpen}>
++	<Dialog.Portal>
++		<Dialog.Overlay class="bg-background/80 fixed inset-0 z-50 backdrop-blur-sm" />
++		<Dialog.Content
++			class="bg-background fixed top-[50%] left-[50%] z-50 grid max-h-[90vh] w-full max-w-md translate-x-[-50%] translate-y-[-50%] gap-4 overflow-y-auto border p-6 shadow-lg duration-200 sm:rounded-lg"
++		>
++			<Dialog.Header>
++				<Dialog.Title>编辑板块</Dialog.Title>
++				<Dialog.Description>
++					开关要显示的板块，用箭头调整顺序，保存后对所有浏览器生效
++				</Dialog.Description>
++			</Dialog.Header>
+ 
+-			<Card class="overflow-hidden">
+-				<CardHeader class="flex flex-row items-center justify-between space-y-0 pb-2">
+-					<CardTitle class="text-sm font-medium">CPU 使用情况</CardTitle>
+-					<CpuIcon class="text-muted-foreground h-4 w-4" />
+-				</CardHeader>
+-				<CardContent class="overflow-hidden">
+-					{#if sysInfo}
+-						<div class="mb-4 space-y-2">
+-							<div class="flex items-center justify-between text-sm">
+-								<span>当前 CPU 使用率</span>
+-								<span class="font-medium">{formatCpu(sysInfo.used_cpu)}</span>
+-							</div>
++			<div class="space-y-2">
++				{#each draft as id, index (id)}
++					<div class="flex items-center justify-between rounded-md border px-3 py-2">
++						<div class="flex items-center gap-2">
++							<Switch checked={true} onCheckedChange={(checked) => toggleBlock(id, checked)} />
++							<Label class="text-sm">{titleOf(id)}</Label>
+ 						</div>
+-					{/if}
+-					{#if cpuHistory.length > 0}
+-						<Chart.Container config={cpuChartConfig} class="h-[150px] w-full">
+-							<AreaChart
+-								data={cpuHistory}
+-								x="time"
+-								axis="x"
+-								series={[
+-									{
+-										key: 'used',
+-										label: cpuChartConfig.used.label,
+-										color: cpuChartConfig.used.color
+-									},
+-									{
+-										key: 'process',
+-										label: cpuChartConfig.process.label,
+-										color: cpuChartConfig.process.color
+-									}
+-								]}
+-								props={{
+-									area: {
+-										curve: curveNatural,
+-										line: { class: 'stroke-1' },
+-										'fill-opacity': 0.4
+-									},
+-									xAxis: {
+-										format: () => ''
+-									}
+-								}}
++						<div class="flex items-center gap-1">
++							<Button
++								variant="ghost"
++								size="sm"
++								disabled={index === 0}
++								onclick={() => moveBlock(index, -1)}
+ 							>
+-								{#snippet tooltip({ context })}
+-									<MyChartTooltip
+-										{context}
+-										labelFormatter={(timestamp: number) => {
+-											return formatTimestamp(timestamp);
+-										}}
+-										valueFormatter={(v: number) => formatCpu(v)}
+-										indicator="line"
+-									/>
+-								{/snippet}
+-							</AreaChart>
+-						</Chart.Container>
+-					{:else}
+-						<div class="text-muted-foreground flex h-[150px] items-center justify-center text-sm">
+-							等待数据...
++								<ChevronUpIcon class="h-4 w-4" />
++							</Button>
++							<Button
++								variant="ghost"
++								size="sm"
++								disabled={index === draft.length - 1}
++								onclick={() => moveBlock(index, 1)}
++							>
++								<ChevronDownIcon class="h-4 w-4" />
++							</Button>
+ 						</div>
+-					{/if}
+-				</CardContent>
+-			</Card>
+-		</div>
+-	{/if}
+-</div>
++					</div>
++				{/each}
++				{#each hiddenBlocks as id (id)}
++					<div class="flex items-center justify-between rounded-md border px-3 py-2 opacity-60">
++						<div class="flex items-center gap-2">
++							<Switch checked={false} onCheckedChange={(checked) => toggleBlock(id, checked)} />
++							<Label class="text-sm">{titleOf(id)}</Label>
++						</div>
++						<span class="text-muted-foreground text-xs">未显示</span>
++					</div>
++				{/each}
++			</div>
++
++			<div class="flex justify-end gap-2">
++				<Button variant="outline" size="sm" onclick={() => (editOpen = false)}>取消</Button>
++				<Button size="sm" onclick={saveLayout} disabled={saving}>
++					{saving ? '保存中...' : '保存'}
++				</Button>
++			</div>
++		</Dialog.Content>
++	</Dialog.Portal>
++</Dialog.Root>
 diff --git a/web/src/routes/storage/+page.svelte b/web/src/routes/storage/+page.svelte
 new file mode 100644
 index 0000000..f7565f8

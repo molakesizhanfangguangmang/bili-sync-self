@@ -16,7 +16,8 @@
 补丁内容：
 
 - `web/src/lib/components/app-sidebar.svelte`：「内容管理」组加一项「存储」→ `/storage`
-- `web/src/routes/storage/+page.svelte`：新增，iframe 指向 `location.hostname:12346`（steward）
+- `web/src/routes/storage/+page.svelte`：新增，iframe 指向 `location.hostname:12346`（steward），
+  并把当前明暗当 `?theme=dark|light` 一起带过去（steward 认这个参数，直接打开它自己的页面时按系统偏好）
 
 ## 为什么不是真 fork
 

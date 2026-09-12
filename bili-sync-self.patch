@@ -26,21 +26,31 @@ index 7045931..769e4d8 100644
  			{
 diff --git a/web/src/routes/storage/+page.svelte b/web/src/routes/storage/+page.svelte
 new file mode 100644
-index 0000000..c236574
+index 0000000..f7565f8
 --- /dev/null
 +++ b/web/src/routes/storage/+page.svelte
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,35 @@
 +<script lang="ts">
 +	import { setBreadcrumb } from '$lib/stores/breadcrumb';
 +	import { onMount } from 'svelte';
 +
 +	// steward（核盘 / 文件 / 下载列表）跑在同一个容器里，映射到宿主机 12346 端口。
 +	// 用当前访问的主机名拼地址，从局域网 IP 或 localhost 打开都能用。
++	// iframe 是另一个源，读不到本页的主题，所以把当前明暗当查询参数带过去，
++	// 那边认 ?theme=dark|light（不带参数时按它自己的系统偏好）。
 +	let src = '';
 +
 +	onMount(() => {
 +		setBreadcrumb([{ label: '存储' }]);
-+		src = `${location.protocol}//${location.hostname}:12346/`;
++		const theme = () => (document.documentElement.classList.contains('dark') ? 'dark' : 'light');
++		const url = () => `${location.protocol}//${location.hostname}:12346/?theme=${theme()}`;
++		src = url();
++		// 页面上切明暗时把新主题重新带过去（换 src 会让 iframe 重载一次，切换不常发生，可以接受）
++		const observer = new MutationObserver(() => {
++			src = url();
++		});
++		observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
++		return () => observer.disconnect();
 +	});
 +</script>
 +

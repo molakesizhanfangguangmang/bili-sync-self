@@ -1,8 +1,78 @@
+diff --git a/crates/bili_sync/src/api/request.rs b/crates/bili_sync/src/api/request.rs
+index fca8ba2..a07b6af 100644
+--- a/crates/bili_sync/src/api/request.rs
++++ b/crates/bili_sync/src/api/request.rs
+@@ -42,6 +42,13 @@ pub struct ResetVideoStatusRequest {
+     pub force: bool,
+ }
+ 
++#[derive(Deserialize)]
++pub struct DownloadVideoRequest {
++    /// 同一视频（bvid）已经有下载完成的一份时，是否删掉那一份重新下载
++    #[serde(default)]
++    pub overwrite: bool,
++}
++
+ #[derive(Deserialize)]
+ pub struct ResetFilteredVideoStatusRequest {
+     pub collection: Option<i32>,
 diff --git a/crates/bili_sync/src/api/response.rs b/crates/bili_sync/src/api/response.rs
-index 44ee854..8d3ad61 100644
+index 44ee854..b57e5ae 100644
 --- a/crates/bili_sync/src/api/response.rs
 +++ b/crates/bili_sync/src/api/response.rs
-@@ -193,6 +193,16 @@ pub struct DashBoardResponse {
+@@ -17,10 +17,41 @@ pub struct VideoSourcesResponse {
+ 
+ #[derive(Serialize)]
+ pub struct VideosResponse {
+-    pub videos: Vec<VideoInfo>,
++    pub videos: Vec<VideoListItem>,
+     pub total_count: u64,
+ }
+ 
++/// 视频列表里的一条。默认视图下同一个 bvid 会被折叠成一条，此时 source_count
++/// 记录折叠了几条（也就是这个视频出现在几个来源里）；按来源筛选时不做折叠，字段缺省。
++#[derive(Serialize)]
++pub struct VideoListItem {
++    #[serde(flatten)]
++    pub video: VideoInfo,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub source_count: Option<usize>,
++}
++
++/// 「立即下载」的结果
++#[derive(Serialize)]
++#[serde(rename_all = "snake_case")]
++pub enum DownloadVideoStatus {
++    /// 已经排进下载队列
++    Enqueued,
++    /// 库里已经有一份下载完成的同一视频，等前端确认要不要删掉重下
++    AlreadyExists,
++    /// 视频已失效，不下
++    Invalid,
++}
++
++#[derive(Serialize)]
++pub struct DownloadVideoResponse {
++    pub status: DownloadVideoStatus,
++    /// 覆盖重下时删文件夹留下的警告
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub warning: Option<String>,
++    pub video: VideoInfo,
++}
++
+ #[derive(Serialize)]
+ pub struct VideoResponse {
+     pub video: VideoInfo,
+@@ -67,7 +98,7 @@ pub struct VideoSource {
+     pub name: String,
+ }
+ 
+-#[derive(Serialize, DerivePartialModel, FromQueryResult)]
++#[derive(Serialize, DerivePartialModel, FromQueryResult, Clone)]
+ #[sea_orm(entity = "video::Entity")]
+ pub struct VideoInfo {
+     pub id: i32,
+@@ -193,6 +224,16 @@ pub struct DashBoardResponse {
      pub enabled_submissions: u64,
      pub enable_watch_later: bool,
      pub videos_by_day: Vec<DayCountPair>,
@@ -19,7 +89,7 @@ index 44ee854..8d3ad61 100644
  }
  
  #[derive(Serialize, Clone, Copy)]
-@@ -205,6 +215,10 @@ pub struct SysInfo {
+@@ -205,6 +246,10 @@ pub struct SysInfo {
      pub process_cpu: f32,
      pub total_disk: u64,
      pub available_disk: u64,
@@ -195,6 +265,340 @@ index 061bdd7..c188663 100644
              .merge(ws::router())
              .merge(task::router())
              .layer(middleware::from_fn(auth)),
+diff --git a/crates/bili_sync/src/api/routes/videos/mod.rs b/crates/bili_sync/src/api/routes/videos/mod.rs
+index f779f71..decdcd9 100644
+--- a/crates/bili_sync/src/api/routes/videos/mod.rs
++++ b/crates/bili_sync/src/api/routes/videos/mod.rs
+@@ -1,5 +1,3 @@
+-use std::collections::HashSet;
+-
+ use anyhow::{Context, Result};
+ use axum::extract::{Extension, Path, Query};
+ use axum::routing::{get, post};
+@@ -7,30 +5,40 @@ use axum::{Json, Router};
+ use bili_sync_entity::*;
+ use chrono::NaiveDateTime;
+ use sea_orm::ActiveValue::Set;
+-use sea_orm::sea_query::{Expr, ExprTrait};
++use sea_orm::sea_query::Expr;
+ use sea_orm::{
+     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
+-    QueryOrder, Select, TransactionTrait, TryIntoModel,
++    QueryOrder, QuerySelect, Select, TransactionTrait, TryIntoModel,
+ };
+ 
+ use crate::api::error::InnerApiError;
+ use crate::api::helper::{update_page_download_status, update_video_download_status};
+ use crate::api::request::{
+-    ResetFilteredVideoStatusRequest, ResetVideoStatusRequest, UpdateFilteredVideoStatusRequest,
++    DownloadVideoRequest, ResetFilteredVideoStatusRequest, ResetVideoStatusRequest, UpdateFilteredVideoStatusRequest,
+     UpdateVideoStatusRequest, VideosRequest,
+ };
+ use crate::api::response::{
+-    ClearAndResetVideoStatusResponse, PageInfo, ResetFilteredVideosResponse, ResetVideoResponse, SimplePageInfo,
+-    SimpleVideoInfo, UpdateFilteredVideoStatusResponse, UpdateVideoStatusResponse, VideoInfo, VideoResponse,
+-    VideosResponse,
++    ClearAndResetVideoStatusResponse, DownloadVideoResponse, DownloadVideoStatus, PageInfo, ResetFilteredVideosResponse,
++    ResetVideoResponse, SimplePageInfo, SimpleVideoInfo, UpdateFilteredVideoStatusResponse, UpdateVideoStatusResponse,
++    VideoInfo, VideoListItem, VideoResponse, VideosResponse,
+ };
+ use crate::api::wrapper::{ApiError, ApiResponse, ValidatedJson};
+-use crate::utils::status::{PageStatus, VideoStatus};
++use crate::task::DownloadTaskManager;
++use crate::utils::status::{PageStatus, STATUS_COMPLETED, VideoStatus};
++
++/// 折叠后的同 bvid 分组：最小 id 与条数
++#[derive(sea_orm::FromQueryResult)]
++struct FoldedVideoGroup {
++    bvid: String,
++    min_id: i32,
++    cnt: i64,
++}
+ 
+ pub(super) fn router() -> Router {
+     Router::new()
+         .route("/videos", get(get_videos))
+         .route("/videos/{id}", get(get_video))
++        .route("/videos/{id}/download", post(download_video_now))
+         .route(
+             "/videos/{id}/clear-and-reset-status",
+             post(clear_and_reset_video_status),
+@@ -41,6 +49,53 @@ pub(super) fn router() -> Router {
+         .route("/videos/update-status", post(update_filtered_video_status))
+ }
+ 
++fn to_video_info(video_model: &video::Model) -> VideoInfo {
++    VideoInfo {
++        id: video_model.id,
++        bvid: video_model.bvid.clone(),
++        name: video_model.name.clone(),
++        upper_name: video_model.upper_name.clone(),
++        valid: video_model.valid,
++        should_download: video_model.should_download,
++        download_status: video_model.download_status,
++        collection_id: video_model.collection_id,
++        favorite_id: video_model.favorite_id,
++        submission_id: video_model.submission_id,
++        watch_later_id: video_model.watch_later_id,
++    }
++}
++
++/// 清空重置某个视频：状态归零、删掉分页记录、删掉本地文件夹。
++/// 返回重置后的 Model 与删文件夹时的警告（如果删失败了）。
++async fn clear_and_reset_video(db: &DatabaseConnection, id: i32) -> Result<(video::Model, Option<String>), ApiError> {
++    let video_info = video::Entity::find_by_id(id).one(db).await?;
++    let Some(video_info) = video_info else {
++        return Err(InnerApiError::NotFound(id).into());
++    };
++    let txn = db.begin().await?;
++    let mut video_info = video_info.into_active_model();
++    video_info.single_page = Set(None);
++    video_info.download_status = Set(0);
++    video_info.valid = Set(true);
++    let video_info = video_info.update(&txn).await?;
++    page::Entity::delete_many()
++        .filter(page::Column::VideoId.eq(id))
++        .exec(&txn)
++        .await?;
++    txn.commit().await?;
++    let video_info = video_info.try_into_model()?;
++    let warning = if video_info.path.is_empty() {
++        None
++    } else {
++        tokio::fs::remove_dir_all(&video_info.path)
++            .await
++            .context(format!("删除本地路径「{}」失败", video_info.path))
++            .err()
++            .map(|e| format!("{:#}", e))
++    };
++    Ok((video_info, warning))
++}
++
+ fn apply_created_at_filter(
+     mut query: Select<video::Entity>,
+     created_from: Option<NaiveDateTime>,
+@@ -61,7 +116,11 @@ fn apply_created_at_filter(
+     query
+ }
+ 
+-/// 列出视频的基本信息，支持根据视频来源筛选、名称查找和分页
++/// 列出视频的基本信息，支持根据视频来源筛选、名称查找和分页。
++///
++/// 没有指定视频来源时（即默认视图）把同一个 bvid 的视频折成一条，附上来源数，
++/// 指向「有文件的那条」（下载完成的那条），没有完成份时指向最早入库的那条；
++/// 指定了来源时逐条显示，不做折叠。
+ pub async fn get_videos(
+     Extension(db): Extension<DatabaseConnection>,
+     Query(params): Query<VideosRequest>,
+@@ -91,21 +150,89 @@ pub async fn get_videos(
+         query = query.filter(validation_filter.to_video_query());
+     }
+     query = apply_created_at_filter(query, params.created_from, params.created_to);
+-    let total_count = query.clone().count(&db).await?;
++    let fold = params.collection.is_none()
++        && params.favorite.is_none()
++        && params.submission.is_none()
++        && params.watch_later.is_none();
+     let (page, page_size) = if let (Some(page), Some(page_size)) = (params.page, params.page_size) {
+         (page, page_size)
+     } else {
+         (0, 10)
+     };
+-    Ok(ApiResponse::ok(VideosResponse {
+-        videos: query
++    if !fold {
++        let total_count = query.clone().count(&db).await?;
++        let videos = query
+             .order_by_desc(video::Column::Id)
+             .into_partial_model::<VideoInfo>()
+             .paginate(&db, page_size)
+             .fetch_page(page)
+-            .await?,
+-        total_count,
+-    }))
++            .await?
++            .into_iter()
++            .map(|video| VideoListItem {
++                video,
++                source_count: None,
++            })
++            .collect();
++        return Ok(ApiResponse::ok(VideosResponse { videos, total_count }));
++    }
++    // 折叠视图：总数是不同的 bvid 个数，分页按「同 bvid 里最小的 id」倒序
++    let total_count = query
++        .clone()
++        .select_only()
++        .column(video::Column::Bvid)
++        .group_by(video::Column::Bvid)
++        .count(&db)
++        .await?;
++    let groups = query
++        .clone()
++        .select_only()
++        .column(video::Column::Bvid)
++        .column_as(Expr::col(video::Column::Id).min(), "min_id")
++        .column_as(Expr::col(video::Column::Id).count(), "cnt")
++        .group_by(video::Column::Bvid)
++        .order_by_desc(Expr::col(video::Column::Id).min())
++        .into_model::<FoldedVideoGroup>()
++        .paginate(&db, page_size)
++        .fetch_page(page)
++        .await?;
++    let bvids = groups.iter().map(|group| group.bvid.clone()).collect::<Vec<String>>();
++    // 代表行要再取一次：同一 bvid 可能有多条（不同来源），按同一套筛选条件挑出要展示的那条
++    let rows = if bvids.is_empty() {
++        Vec::new()
++    } else {
++        query
++            .clone()
++            .filter(video::Column::Bvid.is_in(bvids))
++            .into_partial_model::<VideoInfo>()
++            .all(&db)
++            .await?
++    };
++    let mut videos = Vec::with_capacity(groups.len());
++    for group in groups {
++        let mut chosen: Option<&VideoInfo> = None;
++        for video_info in rows.iter().filter(|video_info| video_info.bvid == group.bvid) {
++            let better = match chosen {
++                None => true,
++                Some(current) => {
++                    let current_completed = VideoStatus::from(current.download_status).get_completed();
++                    let candidate_completed = VideoStatus::from(video_info.download_status).get_completed();
++                    // 优先挑下载完成的那条，都是同一类时挑 id 最小的
++                    (candidate_completed && !current_completed)
++                        || (candidate_completed == current_completed && video_info.id < current.id)
++                }
++            };
++            if better {
++                chosen = Some(video_info);
++            }
++        }
++        if let Some(chosen) = chosen {
++            videos.push(VideoListItem {
++                video: chosen.clone(),
++                source_count: Some(group.cnt.max(0) as usize),
++            });
++        }
++    }
++    Ok(ApiResponse::ok(VideosResponse { videos, total_count }))
+ }
+ 
+ pub async fn get_video(
+@@ -129,6 +256,63 @@ pub async fn get_video(
+     }))
+ }
+ 
++/// 「立即下载」：把这一条塞进下载队列，跟队列顺序走，不等下一轮 interval，也不抢占正在跑的任务。
++///
++/// 同一个 bvid 已经有下载完成的一份时，先回 already_exists 让前端问一句，
++/// 用户确认覆盖后带 overwrite 再来一次：先清空重置「有文件的那条」（删文件夹、状态归零），再只下这一条。
++pub async fn download_video_now(
++    Path(id): Path<i32>,
++    Extension(db): Extension<DatabaseConnection>,
++    Json(request): Json<DownloadVideoRequest>,
++) -> Result<ApiResponse<DownloadVideoResponse>, ApiError> {
++    let Some(video_model) = video::Entity::find_by_id(id).one(&db).await? else {
++        return Err(InnerApiError::NotFound(id).into());
++    };
++    if !video_model.valid {
++        return Ok(ApiResponse::ok(DownloadVideoResponse {
++            status: DownloadVideoStatus::Invalid,
++            warning: None,
++            video: to_video_info(&video_model),
++        }));
++    }
++    // 同一 bvid 有没有已经下载完成的一份（完成标记是 download_status 的最高位）
++    let completed_exists = video::Entity::find()
++        .filter(video::Column::Bvid.eq(video_model.bvid.as_str()))
++        .filter(video::Column::DownloadStatus.gte(STATUS_COMPLETED))
++        .count(&db)
++        .await?
++        > 0;
++    if completed_exists && !request.overwrite {
++        return Ok(ApiResponse::ok(DownloadVideoResponse {
++            status: DownloadVideoStatus::AlreadyExists,
++            warning: None,
++            video: to_video_info(&video_model),
++        }));
++    }
++    let mut target = video_model;
++    let mut warning = None;
++    if completed_exists {
++        // 覆盖重下：以「有文件的那条」为准清空重置，避免留下孤儿文件夹
++        let completed = video::Entity::find()
++            .filter(video::Column::Bvid.eq(target.bvid.as_str()))
++            .filter(video::Column::DownloadStatus.gte(STATUS_COMPLETED))
++            .order_by_asc(video::Column::Id)
++            .one(&db)
++            .await?;
++        if let Some(completed) = completed {
++            let (cleared, clear_warning) = clear_and_reset_video(&db, completed.id).await?;
++            warning = clear_warning;
++            target = cleared;
++        }
++    }
++    DownloadTaskManager::get().download_video_once(target.id).await?;
++    Ok(ApiResponse::ok(DownloadVideoResponse {
++        status: DownloadVideoStatus::Enqueued,
++        warning,
++        video: to_video_info(&target),
++    }))
++}
++
+ pub async fn reset_video_status(
+     Path(id): Path<i32>,
+     Extension(db): Extension<DatabaseConnection>,
+@@ -192,46 +376,10 @@ pub async fn clear_and_reset_video_status(
+     Path(id): Path<i32>,
+     Extension(db): Extension<DatabaseConnection>,
+ ) -> Result<ApiResponse<ClearAndResetVideoStatusResponse>, ApiError> {
+-    let video_info = video::Entity::find_by_id(id).one(&db).await?;
+-    let Some(video_info) = video_info else {
+-        return Err(InnerApiError::NotFound(id).into());
+-    };
+-    let txn = db.begin().await?;
+-    let mut video_info = video_info.into_active_model();
+-    video_info.single_page = Set(None);
+-    video_info.download_status = Set(0);
+-    video_info.valid = Set(true);
+-    let video_info = video_info.update(&txn).await?;
+-    page::Entity::delete_many()
+-        .filter(page::Column::VideoId.eq(id))
+-        .exec(&txn)
+-        .await?;
+-    txn.commit().await?;
+-    let video_info = video_info.try_into_model()?;
+-    let warning = if video_info.path.is_empty() {
+-        None
+-    } else {
+-        tokio::fs::remove_dir_all(&video_info.path)
+-            .await
+-            .context(format!("删除本地路径「{}」失败", video_info.path))
+-            .err()
+-            .map(|e| format!("{:#}", e))
+-    };
++    let (video_info, warning) = clear_and_reset_video(&db, id).await?;
+     Ok(ApiResponse::ok(ClearAndResetVideoStatusResponse {
+         warning,
+-        video: VideoInfo {
+-            id: video_info.id,
+-            bvid: video_info.bvid,
+-            name: video_info.name,
+-            upper_name: video_info.upper_name,
+-            valid: video_info.valid,
+-            should_download: video_info.should_download,
+-            download_status: video_info.download_status,
+-            collection_id: video_info.collection_id,
+-            favorite_id: video_info.favorite_id,
+-            submission_id: video_info.submission_id,
+-            watch_later_id: video_info.watch_later_id,
+-        },
++        video: to_video_info(&video_info),
+     }))
+ }
+ 
 diff --git a/crates/bili_sync/src/api/routes/ws/mod.rs b/crates/bili_sync/src/api/routes/ws/mod.rs
 index def0634..c50ab48 100644
 --- a/crates/bili_sync/src/api/routes/ws/mod.rs
@@ -287,19 +691,439 @@ index def0634..c50ab48 100644
 +    let _ = baseline;
 +    (0, 0)
 +}
+diff --git a/crates/bili_sync/src/task/video_downloader.rs b/crates/bili_sync/src/task/video_downloader.rs
+index 1ba8051..a8e2114 100644
+--- a/crates/bili_sync/src/task/video_downloader.rs
++++ b/crates/bili_sync/src/task/video_downloader.rs
+@@ -11,9 +11,9 @@ use tokio_cron_scheduler::{Job, JobScheduler};
+ use crate::adapter::VideoSource;
+ use crate::bilibili::{self, BiliClient, BiliError};
+ use crate::config::{ARGS, Config, TEMPLATE, Trigger, VersionedConfig};
+-use crate::utils::model::get_enabled_video_sources;
++use crate::utils::model::{find_duplicated_video_ids, get_enabled_video_sources};
+ use crate::utils::notify::error_and_notify;
+-use crate::workflow::process_video_source;
++use crate::workflow::{download_single_video, process_video_source};
+ 
+ static INSTANCE: OnceCell<DownloadTaskManager> = OnceCell::const_new();
+ 
+@@ -44,6 +44,7 @@ struct TaskContext {
+     status_tx: watch::Sender<TaskStatus>,
+     status_rx: watch::Receiver<TaskStatus>,
+     video_task_id: tokio::sync::Mutex<Option<uuid::Uuid>>, // 存储当前视频下载任务的 UUID
++    pending_manual_downloads: tokio::sync::Mutex<Vec<i32>>, // 「立即下载」排着队的视频 id
+ }
+ 
+ impl DownloadTaskManager {
+@@ -81,6 +82,22 @@ impl DownloadTaskManager {
+         Ok(())
+     }
+ 
++    /// 「立即下载」：把单个视频排进下载队列。
++    /// 不插队，等正在跑的那轮任务结束后再按排队顺序下载。
++    pub async fn download_video_once(&self, video_id: i32) -> Result<()> {
++        self.cx.pending_manual_downloads.lock().await.push(video_id);
++        let _ = self
++            .sched
++            .lock()
++            .await
++            .add(Job::new_one_shot_async(
++                Duration::from_secs(0),
++                DownloadTaskManager::download_manual_video_task(self.cx.clone()),
++            )?)
++            .await?;
++        Ok(())
++    }
++
+     /// 启动任务调度器
+     async fn start(&self) -> Result<()> {
+         self.sched.lock().await.start().await?;
+@@ -105,6 +122,7 @@ impl DownloadTaskManager {
+             status_tx,
+             status_rx,
+             video_task_id,
++            pending_manual_downloads: tokio::sync::Mutex::new(Vec::new()),
+         });
+         // 读取初始配置
+         let mut rx = VersionedConfig::get().subscribe();
+@@ -263,6 +281,48 @@ impl DownloadTaskManager {
+         }
+     }
+ 
++    fn download_manual_video_task(
++        cx: Arc<TaskContext>,
++    ) -> impl FnMut(uuid::Uuid, JobScheduler) -> Pin<Box<dyn Future<Output = ()> + Send>> {
++        move |_uuid, _l| {
++            let cx = cx.clone();
++            Box::pin(async move {
++                // 不插队：等正在跑的那轮下载任务结束
++                let _lock = cx.running.lock().await;
++                let pending = std::mem::take(&mut *cx.pending_manual_downloads.lock().await);
++                if pending.is_empty() {
++                    return;
++                }
++                let config = VersionedConfig::get().snapshot();
++                info!("开始执行手动下载任务（{} 个视频）..", pending.len());
++                let result = async {
++                    let bili_client = cx.bili_client.snapshot().context("获取 BiliClient 失败")?;
++                    for video_id in pending {
++                        match download_single_video(video_id, &bili_client, &cx.connection, &config).await {
++                            Ok(_) => info!("视频 {} 手动下载完成", video_id),
++                            Err(e) => error_and_notify(
++                                &config,
++                                &bili_client,
++                                format!("视频 {} 手动下载失败：{:#}", video_id, e),
++                                &e,
++                            ),
++                        }
++                    }
++                    Result::<(), anyhow::Error>::Ok(())
++                }
++                .await;
++                if let Err(e) = result {
++                    error_and_notify(
++                        &config,
++                        &cx.bili_client,
++                        format!("手动下载任务执行遇到错误：{:#}", e),
++                        &e,
++                    );
++                }
++            })
++        }
++    }
++
+     fn download_video_task(
+         cx: Arc<TaskContext>,
+     ) -> impl FnMut(uuid::Uuid, JobScheduler) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+@@ -357,9 +417,22 @@ async fn download_video(
+     if video_sources.is_empty() {
+         bail!("没有可用的视频源");
+     }
++    // 同一个 bvid 只下一份：先把本轮要跳过的重复记录算出来，整轮共用
++    let duplicated_video_ids = find_duplicated_video_ids(connection)
++        .await
++        .context("计算重复视频失败")?;
+     for video_source in video_sources {
+         let display_name = video_source.display_name();
+-        if let Err(e) = process_video_source(video_source, &bili_client, connection, &template, config).await {
++        if let Err(e) = process_video_source(
++            video_source,
++            &bili_client,
++            connection,
++            &template,
++            config,
++            &duplicated_video_ids,
++        )
++        .await
++        {
+             error_and_notify(
+                 config,
+                 &bili_client,
+diff --git a/crates/bili_sync/src/utils/model.rs b/crates/bili_sync/src/utils/model.rs
+index 5542748..0fbab10 100644
+--- a/crates/bili_sync/src/utils/model.rs
++++ b/crates/bili_sync/src/utils/model.rs
+@@ -1,3 +1,5 @@
++use std::collections::{HashMap, HashSet};
++
+ use anyhow::{Context, Result, anyhow};
+ use bili_sync_entity::*;
+ use itertools::Itertools;
+@@ -10,7 +12,7 @@ use sea_orm::{ConnectionTrait, DatabaseTransaction, IdenStatic, Statement};
+ use crate::adapter::{VideoSource, VideoSourceEnum};
+ use crate::bilibili::VideoInfo;
+ use crate::config::Config;
+-use crate::utils::status::STATUS_COMPLETED;
++use crate::utils::status::{STATUS_COMPLETED, VideoStatus};
+ 
+ /// 筛选未填充的视频
+ pub async fn filter_unfilled_videos(
+@@ -52,6 +54,100 @@ pub async fn filter_unhandled_video_pages(
+         .context("filter unhandled video pages failed")
+ }
+ 
++/// 判断视频是否已经下载完成（完成标记是 download_status 的最高位）
++fn is_download_completed(download_status: u32) -> bool {
++    VideoStatus::from(download_status).get_completed()
++}
++
++/// 判断视频来源是否还启用着。手动/自动下载都只看启用的来源，停用来源里的记录不该挡住别的来源
++fn is_from_enabled_source(
++    video_model: &video::Model,
++    favorite_ids: &HashSet<i32>,
++    collection_ids: &HashSet<i32>,
++    submission_ids: &HashSet<i32>,
++    watch_later_ids: &HashSet<i32>,
++) -> bool {
++    video_model.favorite_id.is_some_and(|id| favorite_ids.contains(&id))
++        || video_model.collection_id.is_some_and(|id| collection_ids.contains(&id))
++        || video_model.submission_id.is_some_and(|id| submission_ids.contains(&id))
++        || video_model
++            .watch_later_id
++            .is_some_and(|id| watch_later_ids.contains(&id))
++}
++
++/// 计算本轮应该跳过的视频 id：同一个 bvid 只下一份。
++///
++/// 判据只看 bvid（联合投稿的视频也算重复）：
++/// - 同一个 bvid 已经有一份下载完成，其余那些都不再下；
++/// - 否则只留最早入库（id 最小）的那条「要下」的记录（有效、标记为要下、来源仍启用），其余的不再下。
++///
++/// 返回的集合只用在下载候选上，不改数据库、也不影响列表与状态展示。
++pub async fn find_duplicated_video_ids(connection: &DatabaseConnection) -> Result<HashSet<i32>> {
++    let videos = video::Entity::find()
++        .filter(video::Column::Category.eq(2))
++        .all(connection)
++        .await
++        .context("query videos for deduplication failed")?;
++    let (favorites, collections, submissions, watch_laters) = tokio::try_join!(
++        favorite::Entity::find()
++            .filter(favorite::Column::Enabled.eq(true))
++            .all(connection),
++        collection::Entity::find()
++            .filter(collection::Column::Enabled.eq(true))
++            .all(connection),
++        submission::Entity::find()
++            .filter(submission::Column::Enabled.eq(true))
++            .all(connection),
++        watch_later::Entity::find()
++            .filter(watch_later::Column::Enabled.eq(true))
++            .all(connection),
++    )?;
++    let favorite_ids = favorites.into_iter().map(|model| model.id).collect::<HashSet<i32>>();
++    let collection_ids = collections.into_iter().map(|model| model.id).collect::<HashSet<i32>>();
++    let submission_ids = submissions.into_iter().map(|model| model.id).collect::<HashSet<i32>>();
++    let watch_later_ids = watch_laters.into_iter().map(|model| model.id).collect::<HashSet<i32>>();
++    let mut grouped = HashMap::<&str, Vec<&video::Model>>::new();
++    for video_model in &videos {
++        grouped.entry(video_model.bvid.as_str()).or_default().push(video_model);
++    }
++    let mut duplicated = HashSet::new();
++    for group in grouped.values() {
++        if group.len() < 2 {
++            continue;
++        }
++        if group.iter().any(|video_model| is_download_completed(video_model.download_status)) {
++            for video_model in group
++                .iter()
++                .filter(|video_model| !is_download_completed(video_model.download_status))
++            {
++                duplicated.insert(video_model.id);
++            }
++            continue;
++        }
++        let earliest = group
++            .iter()
++            .filter(|video_model| {
++                video_model.valid
++                    && video_model.should_download
++                    && is_from_enabled_source(
++                        video_model,
++                        &favorite_ids,
++                        &collection_ids,
++                        &submission_ids,
++                        &watch_later_ids,
++                    )
++            })
++            .map(|video_model| video_model.id)
++            .min();
++        if let Some(earliest) = earliest {
++            for video_model in group.iter().filter(|video_model| video_model.id != earliest) {
++                duplicated.insert(video_model.id);
++            }
++        }
++    }
++    Ok(duplicated)
++}
++
+ /// 尝试创建 Video Model，如果发生冲突则忽略
+ pub async fn create_videos(
+     videos_info: Vec<VideoInfo>,
+diff --git a/crates/bili_sync/src/workflow.rs b/crates/bili_sync/src/workflow.rs
+index a0d9d46..c2be820 100644
+--- a/crates/bili_sync/src/workflow.rs
++++ b/crates/bili_sync/src/workflow.rs
+@@ -2,7 +2,7 @@ use std::collections::HashSet;
+ use std::path::{Path, PathBuf};
+ use std::pin::Pin;
+ 
+-use anyhow::{Context, Result, anyhow, bail};
++use anyhow::{Context, Result, anyhow, bail, ensure};
+ use bili_sync_entity::upper_vec::Upper;
+ use bili_sync_entity::*;
+ use futures::stream::{self, FuturesUnordered};
+@@ -15,7 +15,7 @@ use tokio::fs;
+ 
+ use crate::adapter::{VideoSource, VideoSourceEnum};
+ use crate::bilibili::{BestStream, BiliClient, BiliError, Dimension, PageInfo, Video, VideoInfo};
+-use crate::config::{ARGS, Config, PathSafeTemplate};
++use crate::config::{ARGS, Config, PathSafeTemplate, TEMPLATE};
+ use crate::downloader::Downloader;
+ use crate::error::ExecutionStatus;
+ use crate::notifier::DownloadNotifyInfo;
+@@ -47,6 +47,7 @@ pub async fn process_video_source(
+     connection: &DatabaseConnection,
+     template: &handlebars::Handlebars<'_>,
+     config: &Config,
++    duplicated_video_ids: &HashSet<i32>,
+ ) -> Result<()> {
+     // 预创建视频源目录，提前检测目录是否可写
+     video_source.create_dir_all().await?;
+@@ -71,6 +72,7 @@ pub async fn process_video_source(
+             template,
+             config,
+             &danmaku_update_video_ids,
++            duplicated_video_ids,
+         )
+         .await?;
+         if download_notify_info.should_notify() {
+@@ -213,6 +215,7 @@ pub async fn download_unprocessed_videos(
+     template: &handlebars::Handlebars<'_>,
+     config: &Config,
+     danmaku_update_video_ids: &HashSet<i32>,
++    duplicated_video_ids: &HashSet<i32>,
+ ) -> Result<DownloadNotifyInfo> {
+     video_source.log_download_video_start();
+     let downloader = Downloader::new(bili_client.client.clone());
+@@ -231,7 +234,12 @@ pub async fn download_unprocessed_videos(
+         config,
+         filter_option,
+     );
+-    let unhandled_videos_pages = filter_unhandled_video_pages(video_source.filter_expr(), connection).await?;
++    let unhandled_videos_pages = filter_unhandled_video_pages(video_source.filter_expr(), connection)
++        .await?
++        .into_iter()
++        // 同一个 bvid 只下一份，重复的记录在这里被跳过（判据见 find_duplicated_video_ids）
++        .filter(|(video_model, _)| !duplicated_video_ids.contains(&video_model.id))
++        .collect::<Vec<_>>();
+     let mut assigned_upper_ids = HashSet::new();
+     let tasks = stream::iter(unhandled_videos_pages)
+         .map(|(mut video_model, pages_model)| {
+@@ -285,6 +293,94 @@ pub async fn download_unprocessed_videos(
+     Ok(download_notify_info)
+ }
+ 
++/// 找到视频所属的视频源：手动下载单条视频时需要用它来定位保存目录与过滤规则
++async fn find_video_source(video_model: &video::Model, connection: &DatabaseConnection) -> Result<VideoSourceEnum> {
++    if let Some(id) = video_model.favorite_id
++        && let Some(source) = favorite::Entity::find_by_id(id).one(connection).await?
++    {
++        return Ok(VideoSourceEnum::from(source));
++    }
++    if let Some(id) = video_model.collection_id
++        && let Some(source) = collection::Entity::find_by_id(id).one(connection).await?
++    {
++        return Ok(VideoSourceEnum::from(source));
++    }
++    if let Some(id) = video_model.submission_id
++        && let Some(source) = submission::Entity::find_by_id(id).one(connection).await?
++    {
++        return Ok(VideoSourceEnum::from(source));
++    }
++    if let Some(id) = video_model.watch_later_id
++        && let Some(source) = watch_later::Entity::find_by_id(id).one(connection).await?
++    {
++        return Ok(VideoSourceEnum::from(source));
++    }
++    bail!(
++        "视频「{}」（{}）没有可用的视频来源，无法下载",
++        video_model.name,
++        video_model.bvid
++    )
++}
++
++/// 手动下载单个视频：不扫描整轮，只把这一条下下来。
++/// 这条还没填充分页时（例如刚被清空重置过）先补一次详情，再走正常的下载流程。
++pub async fn download_single_video(
++    video_id: i32,
++    bili_client: &BiliClient,
++    connection: &DatabaseConnection,
++    config: &Config,
++) -> Result<()> {
++    config.check().context("配置检查失败")?;
++    // 下载分页依赖全局的 wbi mixin key，正常轮次里由下载任务设置，这里手动补一次
++    let mixin_key = bili_client
++        .wbi_img(&config.credential)
++        .await
++        .context("获取 wbi_img 失败")?
++        .into_mixin_key()
++        .context("解析 mixin key 失败")?;
++    crate::bilibili::set_global_mixin_key(mixin_key);
++    let Some(mut video_model) = video::Entity::find_by_id(video_id).one(connection).await? else {
++        bail!("视频 {} 已不在库中，跳过下载", video_id);
++    };
++    ensure!(video_model.valid, "视频「{}」已失效，跳过下载", video_model.name);
++    let video_source = find_video_source(&video_model, connection).await?;
++    if video_model.single_page.is_none() {
++        fetch_video_details(bili_client, &video_source, connection, config).await?;
++        video_model = video::Entity::find_by_id(video_id)
++            .one(connection)
++            .await?
++            .context("视频在填充详情后从库中消失")?;
++    }
++    let pages_model = page::Entity::find()
++        .filter(page::Column::VideoId.eq(video_id))
++        .order_by_asc(page::Column::Cid)
++        .all(connection)
++        .await?;
++    ensure!(!pages_model.is_empty(), "视频「{}」没有可下载的分页", video_model.name);
++    let template = TEMPLATE.snapshot();
++    let downloader = Downloader::new(bili_client.client.clone());
++    let source_filter_option = video_source
++        .filter_option()
++        .as_ref()
++        .map(|value| serde_json::from_value(value.clone()))
++        .transpose()?;
++    let filter_option = source_filter_option.as_ref().unwrap_or(&config.filter_option);
++    let cx = DownloadContext::new(
++        bili_client,
++        &video_source,
++        &template,
++        connection,
++        &downloader,
++        config,
++        filter_option,
++    );
++    let task_uids = video_model.uppers().map(|upper| upper.mid).collect::<Vec<_>>();
++    info!("开始手动下载视频「{}」（{}）", video_model.name, video_model.bvid);
++    let video_active_model = download_video_pages(video_model, pages_model, task_uids, cx).await?;
++    update_videos_model(vec![video_active_model], connection).await?;
++    Ok(())
++}
++
+ async fn prepare_danmaku_updates(
+     video_source: &VideoSourceEnum,
+     connection: &DatabaseConnection,
 diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
-index 7e02098..4a604a5 100644
+index 7e02098..3fa450f 100644
 --- a/web/src/lib/api.ts
 +++ b/web/src/lib/api.ts
-@@ -5,6 +5,7 @@ import type {
+@@ -4,7 +4,10 @@ import type {
+ 	ClearAndResetVideoResponse,
  	CollectionsResponse,
  	Config,
- 	DashBoardResponse,
 +	DashboardLayout,
+ 	DashBoardResponse,
++	DownloadVideoRequest,
++	DownloadVideoResponse,
  	FavoritesResponse,
  	FullSyncVideoSourceRequest,
  	FullSyncVideoSourceResponse,
-@@ -283,6 +284,14 @@ class ApiClient {
+@@ -176,6 +179,13 @@ class ApiClient {
+ 		return this.post<ClearAndResetVideoResponse>(`/videos/${id}/clear-and-reset-status`);
+ 	}
+ 
++	async downloadVideoNow(
++		id: number,
++		request: DownloadVideoRequest
++	): Promise<ApiResponse<DownloadVideoResponse>> {
++		return this.post<DownloadVideoResponse>(`/videos/${id}/download`, request);
++	}
++
+ 	async resetFilteredVideoStatus(
+ 		request: ResetFilteredVideoStatusRequest
+ 	): Promise<ApiResponse<ResetFilteredVideosResponse>> {
+@@ -283,6 +293,14 @@ class ApiClient {
  		return this.get<DashBoardResponse>('/dashboard');
  	}
  
@@ -314,7 +1138,16 @@ index 7e02098..4a604a5 100644
  	async triggerDownloadTask(): Promise<ApiResponse<boolean>> {
  		return this.post<boolean>('/task/download');
  	}
-@@ -344,6 +353,8 @@ const api = {
+@@ -317,6 +335,8 @@ const api = {
+ 	resetVideoStatus: (id: number, request: ResetVideoStatusRequest) =>
+ 		apiClient.resetVideoStatus(id, request),
+ 	clearAndResetVideoStatus: (id: number) => apiClient.clearAndResetVideoStatus(id),
++	downloadVideoNow: (id: number, request: DownloadVideoRequest) =>
++		apiClient.downloadVideoNow(id, request),
+ 	resetFilteredVideoStatus: (request: ResetFilteredVideoStatusRequest) =>
+ 		apiClient.resetFilteredVideoStatus(request),
+ 	updateVideoStatus: (id: number, request: UpdateVideoStatusRequest) =>
+@@ -344,6 +364,8 @@ const api = {
  	getConfig: () => apiClient.getConfig(),
  	updateConfig: (config: Config) => apiClient.updateConfig(config),
  	getDashboard: () => apiClient.getDashboard(),
@@ -349,11 +1182,217 @@ index 7045931..769e4d8 100644
  				]
  			},
  			{
+diff --git a/web/src/lib/components/video-card.svelte b/web/src/lib/components/video-card.svelte
+index cd79780..e0827e8 100644
+--- a/web/src/lib/components/video-card.svelte
++++ b/web/src/lib/components/video-card.svelte
+@@ -6,15 +6,18 @@
+ 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
+ 	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
+ 	import { Label } from '$lib/components/ui/label/index.js';
+-	import type { VideoInfo } from '$lib/types';
++	import type { DownloadVideoStatus, VideoInfo } from '$lib/types';
+ 	import BrushCleaningIcon from '@lucide/svelte/icons/brush-cleaning';
+ 	import ClockIcon from '@lucide/svelte/icons/clock';
++	import DownloadIcon from '@lucide/svelte/icons/download';
+ 	import EllipsisIcon from '@lucide/svelte/icons/ellipsis';
+ 	import FolderIcon from '@lucide/svelte/icons/folder';
++	import FoldersIcon from '@lucide/svelte/icons/folders';
+ 	import HeartIcon from '@lucide/svelte/icons/heart';
+ 	import InfoIcon from '@lucide/svelte/icons/info';
+ 	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
+ 	import SquareArrowOutUpRightIcon from '@lucide/svelte/icons/square-arrow-out-up-right';
++	import SquarePenIcon from '@lucide/svelte/icons/square-pen';
+ 	import UserIcon from '@lucide/svelte/icons/user';
+ 	import { goto } from '$app/navigation';
+ 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
+@@ -22,6 +25,7 @@
+ 	// 将 bvid 设置为可选属性，但保留 VideoInfo 的其它所有属性
+ 	export let video: Omit<VideoInfo, 'bvid'> & { bvid?: string };
+ 	export let source: { type: string; name: string } | null = null; // 视频源信息
++	export let sourceCount: number | null = null; // 折叠后同一个 bvid 的来源数（默认视图才有）
+ 	export let showActions: boolean = true; // 控制是否显示操作按钮
+ 	export let mode: 'default' | 'detail' | 'page' = 'default'; // 卡片模式
+ 	export let customTitle: string = ''; // 自定义标题
+@@ -30,10 +34,15 @@
+ 	export let showProgress: boolean = true; // 是否显示进度信息
+ 	export let onReset: ((forceReset: boolean) => Promise<void>) | null = null; // 自定义重置函数
+ 	export let onClearAndReset: (() => Promise<void>) | null = null; // 自定义清空重置函数
++	export let onEditStatus: (() => void) | null = null; // 打开状态编辑器
++	export let onDownloadNow:
++		((overwrite: boolean) => Promise<DownloadVideoStatus | 'error'>) | null = null; // 立即下载这一条
+ 	export let resetDialogOpen = false; // 导出对话框状态，让父组件可以控制
+ 	export let clearAndResetDialogOpen = false; // 导出清空重置对话框状态
++	export let downloadDialogOpen = false; // 导出下载确认框状态
+ 	export let resetting = false;
+ 	export let clearAndResetting = false;
++	export let downloading = false;
+ 
+ 	let forceReset = false;
+ 
+@@ -120,6 +129,35 @@
+ 		clearAndResetDialogOpen = false;
+ 	}
+ 
++	async function handleDownloadNow() {
++		if (!onDownloadNow) {
++			return;
++		}
++		downloading = true;
++		try {
++			// 先不带覆盖试一次：库里已经有完成的一份时后端回 already_exists，这里再问一句
++			const status = await onDownloadNow(false);
++			if (status === 'already_exists') {
++				downloadDialogOpen = true;
++			}
++		} finally {
++			downloading = false;
++		}
++	}
++
++	async function handleDownloadOverwrite() {
++		if (!onDownloadNow) {
++			return;
++		}
++		downloading = true;
++		try {
++			await onDownloadNow(true);
++		} finally {
++			downloading = false;
++			downloadDialogOpen = false;
++		}
++	}
++
+ 	function handleViewDetail() {
+ 		goto(`/video/${video.id}`);
+ 	}
+@@ -177,6 +215,13 @@
+ 				</Badge>
+ 			</div>
+ 		{/if}
++		{#if sourceCount && sourceCount > 1 && video.bvid}
++			<div class="text-muted-foreground mt-1.5 flex min-w-0 items-center gap-1 text-xs">
++				<FoldersIcon class="h-3 w-3 shrink-0" />
++				<span class="cursor-default font-mono" title={video.bvid}>{video.bvid}</span>
++				<span class="shrink-0">· 共 {sourceCount} 个来源，只下一份</span>
++			</div>
++		{/if}
+ 	</CardHeader>
+ 	<CardContent
+ 		class={mode === 'default' ? 'flex min-w-0 flex-1 flex-col justify-end pt-0 pb-3' : 'pt-0 pb-4'}
+@@ -222,6 +267,17 @@
+ 						<span class="truncate">详情</span>
+ 					</Button>
+ 
++					<Button
++						size="sm"
++						variant="outline"
++						class="hover:bg-accent hover:text-accent-foreground h-8 min-w-0 flex-1 cursor-pointer px-3 text-xs font-medium"
++						onclick={handleDownloadNow}
++						disabled={downloading}
++					>
++						<DownloadIcon class="mr-1.5 h-3 w-3 shrink-0" />
++						<span class="truncate">{downloading ? '处理中' : '立即下载'}</span>
++					</Button>
++
+ 					<DropdownMenu.Root>
+ 						<DropdownMenu.Trigger>
+ 							{#snippet child({ props })}
+@@ -236,6 +292,10 @@
+ 							{/snippet}
+ 						</DropdownMenu.Trigger>
+ 						<DropdownMenu.Content align="start" class="w-48">
++							<DropdownMenu.Item class="cursor-pointer" onclick={() => onEditStatus?.()}>
++								<SquarePenIcon class="mr-2 h-4 w-4" />
++								状态编辑
++							</DropdownMenu.Item>
+ 							<DropdownMenu.Item class="cursor-pointer" onclick={() => (resetDialogOpen = true)}>
+ 								<RotateCcwIcon class="mr-2 h-4 w-4" />
+ 								重置
+@@ -309,6 +369,39 @@
+ 	</AlertDialog.Content>
+ </AlertDialog.Root>
+ 
++<!-- 立即下载：已经存在时的覆盖确认框 -->
++<AlertDialog.Root bind:open={downloadDialogOpen}>
++	<AlertDialog.Content>
++		<AlertDialog.Header>
++			<AlertDialog.Title>重新下载并覆盖</AlertDialog.Title>
++			<AlertDialog.Description>
++				视频 <strong>"{displayTitle}"</strong> 已经存在（同一个 bvid
++				的其它来源里已经下过，或本地已有完成的一份）。
++				<br />
++				<br />
++				继续会：
++				<ul class="mt-2 ml-4 list-disc space-y-1">
++					<li class="text-destructive font-medium">删除该视频对应的文件夹（清空重置）</li>
++					<li>重新下载这一条（重复的来源不会各下一份）</li>
++				</ul>
++				<br />
++				此操作<span class="text-destructive font-medium">无法撤销</span>。
++			</AlertDialog.Description>
++		</AlertDialog.Header>
++
++		<AlertDialog.Footer>
++			<AlertDialog.Cancel>取消</AlertDialog.Cancel>
++			<AlertDialog.Action
++				onclick={handleDownloadOverwrite}
++				disabled={downloading}
++				class="bg-destructive hover:bg-destructive/90"
++			>
++				{downloading ? '处理中...' : '重新下载并覆盖'}
++			</AlertDialog.Action>
++		</AlertDialog.Footer>
++	</AlertDialog.Content>
++</AlertDialog.Root>
++
+ <!-- 清空重置确认对话框 -->
+ <AlertDialog.Root bind:open={clearAndResetDialogOpen}>
+ 	<AlertDialog.Content>
 diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
-index ff76d6c..3f8671a 100644
+index ff76d6c..f02ecdc 100644
 --- a/web/src/lib/types.ts
 +++ b/web/src/lib/types.ts
-@@ -384,6 +384,15 @@ export interface DashBoardResponse {
+@@ -43,8 +43,16 @@ export interface VideoInfo {
+ 	watch_later_id?: number;
+ }
+ 
++/**
++ * 视频列表里的一条。默认视图下同一个 bvid 会被折成一条，此时 source_count
++ * 表示折叠了几条（这个视频出现在几个来源里）；按来源筛选时不做折叠，字段缺省。
++ */
++export interface VideoListItem extends VideoInfo {
++	source_count?: number;
++}
++
+ export interface VideosResponse {
+-	videos: VideoInfo[];
++	videos: VideoListItem[];
+ 	total_count: number;
+ }
+ 
+@@ -71,6 +79,20 @@ export interface ClearAndResetVideoResponse {
+ 	video: VideoInfo;
+ }
+ 
++export interface DownloadVideoRequest {
++	/** 同一个 bvid 已经有下载完成的一份时，是否删掉那一份重新下载 */
++	overwrite: boolean;
++}
++
++export type DownloadVideoStatus = 'enqueued' | 'already_exists' | 'invalid';
++
++export interface DownloadVideoResponse {
++	status: DownloadVideoStatus;
++	/** 覆盖重下时删文件夹留下的警告 */
++	warning?: string;
++	video: VideoInfo;
++}
++
+ export interface ResetFilteredVideosResponse {
+ 	resetted: boolean;
+ 	resetted_videos_count: number;
+@@ -384,6 +406,15 @@ export interface DashBoardResponse {
  	enabled_submissions: number;
  	enable_watch_later: boolean;
  	videos_by_day: DayCountPair[];
@@ -369,7 +1408,7 @@ index ff76d6c..3f8671a 100644
  }
  
  export interface SysInfo {
-@@ -396,6 +405,8 @@ export interface SysInfo {
+@@ -396,6 +427,8 @@ export interface SysInfo {
  	total_disk: number;
  	used_disk: number;
  	available_disk: number;
@@ -1563,4 +2602,158 @@ index 0000000..f7565f8
 +		title="steward"
 +		class="bg-background h-[calc(100vh-7rem)] w-full rounded-lg border"
 +	></iframe>
++{/if}
+diff --git a/web/src/routes/videos/+page.svelte b/web/src/routes/videos/+page.svelte
+index ec98bde..e35da8a 100644
+--- a/web/src/routes/videos/+page.svelte
++++ b/web/src/routes/videos/+page.svelte
+@@ -14,6 +14,9 @@
+ 		ApiError,
+ 		VideoSource,
+ 		UpdateFilteredVideoStatusRequest,
++		UpdateVideoStatusRequest,
++		PageInfo,
++		DownloadVideoStatus,
+ 		VideoInfo
+ 	} from '$lib/types';
+ 	import { onMount } from 'svelte';
+@@ -40,6 +43,7 @@
+ 	import DropdownFilter, { type Filter } from '$lib/components/dropdown-filter.svelte';
+ 	import SearchBar from '$lib/components/search-bar.svelte';
+ 	import FilteredStatusEditor from '$lib/components/filtered-status-editor.svelte';
++	import StatusEditor from '$lib/components/status-editor.svelte';
+ 	import StatusFilter from '$lib/components/status-filter.svelte';
+ 	import ValidationFilter from '$lib/components/validation-filter.svelte';
+ 	import CreatedTimeFilter from '$lib/components/created-time-filter.svelte';
+@@ -60,6 +64,12 @@
+ 	let updateAllDialogOpen = false;
+ 	let updatingAll = false;
+ 
++	// 行内「状态编辑」：列表行没有分页信息，打开时单独取一次
++	let statusEditorOpen = false;
++	let statusEditorLoading = false;
++	let statusEditorVideo: VideoInfo | null = null;
++	let statusEditorPages: PageInfo[] = [];
++
+ 	let videoSources: VideoSourcesResponse | null = null;
+ 	let videoSourcesLoaded = false;
+ 	let filters: Record<string, Filter> | null = null;
+@@ -221,6 +231,94 @@
+ 		}
+ 	}
+ 
++	async function handleEditStatus(video: VideoInfo) {
++		statusEditorVideo = video;
++		statusEditorPages = [];
++		statusEditorOpen = true;
++		statusEditorLoading = true;
++		try {
++			// 列表行里没有分页信息，打开编辑器前先取一次详情
++			const result = await api.getVideo(video.id);
++			statusEditorVideo = result.data.video;
++			statusEditorPages = result.data.pages;
++		} catch (error) {
++			console.error('加载视频详情失败：', error);
++			toast.error('加载视频详情失败', {
++				description: (error as ApiError).message
++			});
++			statusEditorOpen = false;
++		} finally {
++			statusEditorLoading = false;
++		}
++	}
++
++	async function handleStatusEditorSubmit(request: UpdateVideoStatusRequest) {
++		if (!statusEditorVideo) {
++			return;
++		}
++		statusEditorLoading = true;
++		try {
++			const result = await api.updateVideoStatus(statusEditorVideo.id, request);
++			const data = result.data;
++			if (data.success) {
++				statusEditorVideo = data.video;
++				statusEditorPages = data.pages;
++				toast.success('状态更新成功', {
++					description: `视频「${data.video.name}」的状态已更新`
++				});
++				await reloadVideos();
++			} else {
++				toast.info('没有状态被更新');
++			}
++		} catch (error) {
++			console.error('状态更新失败：', error);
++			toast.error('状态更新失败', {
++				description: (error as ApiError).message
++			});
++		} finally {
++			statusEditorLoading = false;
++		}
++	}
++
++	async function handleDownloadNow(
++		id: number,
++		overwrite: boolean
++	): Promise<DownloadVideoStatus | 'error'> {
++		try {
++			const result = await api.downloadVideoNow(id, { overwrite });
++			const data = result.data;
++			if (data.status === 'already_exists') {
++				// 让卡片弹覆盖确认框
++				return 'already_exists';
++			}
++			if (data.status === 'invalid') {
++				toast.info('视频已失效', {
++					description: `视频「${data.video.name}」已失效，不下载`
++				});
++				return 'invalid';
++			}
++			if (data.warning) {
++				toast.warning('已加入下载队列', {
++					description: data.warning
++				});
++			} else {
++				toast.success('已加入下载队列', {
++					description: overwrite
++						? `视频「${data.video.name}」已清空重置并重新加入下载队列`
++						: `视频「${data.video.name}」已加入下载队列，跟着队列顺序下`
++				});
++			}
++			await reloadVideos();
++			return 'enqueued';
++		} catch (error) {
++			console.error('加入下载队列失败：', error);
++			toast.error('加入下载队列失败', {
++				description: (error as ApiError).message
++			});
++			return 'error';
++		}
++	}
++
+ 	async function handleResetAllVideos() {
+ 		resettingAll = true;
+ 		try {
+@@ -531,6 +629,9 @@
+ 			<VideoCard
+ 				{video}
+ 				source={getVideoSource(video)}
++				sourceCount={video.source_count ?? null}
++				onEditStatus={() => handleEditStatus(video)}
++				onDownloadNow={(overwrite: boolean) => handleDownloadNow(video.id, overwrite)}
+ 				onReset={async (forceReset: boolean) => {
+ 					await handleResetVideo(video.id, forceReset);
+ 				}}
+@@ -622,3 +723,13 @@
+ 	filterDescriptionParts={filterDescriptionParts || []}
+ 	onsubmit={handleUpdateAllVideos}
+ />
++
++{#if statusEditorVideo}
++	<StatusEditor
++		bind:open={statusEditorOpen}
++		video={statusEditorVideo}
++		pages={statusEditorPages}
++		loading={statusEditorLoading}
++		onsubmit={handleStatusEditorSubmit}
++	/>
 +{/if}

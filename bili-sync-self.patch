@@ -17,10 +17,16 @@ index fca8ba2..a07b6af 100644
  pub struct ResetFilteredVideoStatusRequest {
      pub collection: Option<i32>,
 diff --git a/crates/bili_sync/src/api/response.rs b/crates/bili_sync/src/api/response.rs
-index 44ee854..62ecc1d 100644
+index 44ee854..f2ef458 100644
 --- a/crates/bili_sync/src/api/response.rs
 +++ b/crates/bili_sync/src/api/response.rs
-@@ -17,13 +17,66 @@ pub struct VideoSourcesResponse {
+@@ -1,4 +1,5 @@
+ use bili_sync_entity::rule::Rule;
++use bili_sync_entity::upper_vec::UpperVec;
+ use bili_sync_entity::*;
+ use sea_orm::prelude::DateTime;
+ use sea_orm::{DerivePartialModel, FromQueryResult};
+@@ -17,13 +18,66 @@ pub struct VideoSourcesResponse {
  
  #[derive(Serialize)]
  pub struct VideosResponse {
@@ -89,7 +95,7 @@ index 44ee854..62ecc1d 100644
      pub pages: Vec<PageInfo>,
  }
  
-@@ -67,13 +120,15 @@ pub struct VideoSource {
+@@ -67,13 +121,15 @@ pub struct VideoSource {
      pub name: String,
  }
  
@@ -106,7 +112,7 @@ index 44ee854..62ecc1d 100644
      pub valid: bool,
      pub should_download: bool,
      #[serde(serialize_with = "serde_video_download_status")]
-@@ -93,6 +148,11 @@ pub struct PageInfo {
+@@ -93,6 +149,11 @@ pub struct PageInfo {
      pub name: String,
      #[serde(serialize_with = "serde_page_download_status")]
      pub download_status: u32,
@@ -118,7 +124,7 @@ index 44ee854..62ecc1d 100644
  }
  
  #[derive(Serialize, DerivePartialModel, FromQueryResult, Clone, Copy)]
-@@ -193,6 +253,16 @@ pub struct DashBoardResponse {
+@@ -193,6 +254,16 @@ pub struct DashBoardResponse {
      pub enabled_submissions: u64,
      pub enable_watch_later: bool,
      pub videos_by_day: Vec<DayCountPair>,
@@ -135,7 +141,7 @@ index 44ee854..62ecc1d 100644
  }
  
  #[derive(Serialize, Clone, Copy)]
-@@ -205,6 +275,10 @@ pub struct SysInfo {
+@@ -205,6 +276,10 @@ pub struct SysInfo {
      pub process_cpu: f32,
      pub total_disk: u64,
      pub available_disk: u64,

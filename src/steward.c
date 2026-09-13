@@ -569,6 +569,53 @@ static void disk_usage(const char *path, long long *total, long long *freeb, int
     }
 }
 
+/* 把主机名翻成 IPv4：先看点分十进制，再翻 /etc/hosts。
+ * 静态链接不借 NSS，所以域名走 hosts 文件；容器的 host.docker.internal 就在那里，
+ * 主机换局域网 IP 也不用改配置。 */
+static int resolve_ipv4(const char *host, struct in_addr *out)
+{
+    FILE *fp;
+    char line[512];
+
+    if (inet_pton(AF_INET, host, out) == 1) return 1;
+
+    fp = fopen("/etc/hosts", "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof line, fp)) {
+        char *cmt = strchr(line, '#');
+        const char *p, *end, *q;
+        char ip[64];
+        size_t len;
+        int hit = 0;
+
+        if (cmt) *cmt = 0;
+        p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        end = p;
+        while (*end && *end != ' ' && *end != '\t' && *end != '\n') end++;
+        len = (size_t)(end - p);
+        if (len == 0 || len >= sizeof ip) continue;
+        memcpy(ip, p, len);
+        ip[len] = 0;
+
+        q = end;
+        while (*q && !hit) {
+            const char *w;
+            while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+            w = q;
+            while (*w && *w != ' ' && *w != '\t' && *w != '\n') w++;
+            if (w > q && (size_t)(w - q) == strlen(host) && strncmp(q, host, (size_t)(w - q)) == 0) hit = 1;
+            q = w;
+        }
+        if (hit && inet_pton(AF_INET, ip, out) == 1) {
+            fclose(fp);
+            return 1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
 /* 一条极简 HTTP POST，只打明文 http。返回 1 = 对端答了 200。 */
 static int http_post_json(const char *url, const char *json)
 {
@@ -598,9 +645,11 @@ static int http_post_json(const char *url, const char *json)
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    /* 只认点分十进制 IPv4：静态链接的 glibc 解析域名要借运行时的 NSS 库，不折腾。
-     * 落点本来就是本机的 push-relay，写 IP 就行。 */
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) return 0;
+    /* 域名先翻 /etc/hosts（静态链接不借 NSS），点分十进制直接过。 */
+    if (!resolve_ipv4(host, &addr.sin_addr)) {
+        fprintf(stderr, "[steward] 推送地址解析不了：%s（--push-url 得写名字或点分十进制 IP）\n", host);
+        return 0;
+    }
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return 0;
@@ -2529,13 +2578,14 @@ static void usage(const char *argv0)
 {
     printf("用法: %s [--port N] [--bind ADDR] [--db FILE] [--root DIR] [--token S]\n"
            "          [--floor PCT] [--push-url URL] [--push-every SEC] [--check-every SEC]\n"
-           "          [--state-dir DIR] [--init] [--pending-off] [--selftest] [-v]\n"
+           "          [--state-dir DIR] [--init] [--pending-off] [--selftest] [--push-now] [-v]\n"
            "          [--watch | --no-watch]\n"
            "\n"
            "  --init        建四个默认规则触发器（幂等）并把 rule 为空的源补上\n"
            "  --pending-off 把「要下、但一页都没落过盘」的条目改成不下\n"
            "  --floor PCT   可用空间低于这个百分比就停用所有源（0 = 不管，默认 10）\n"
            "  --push-url    拉闸/恢复时推一条到这个地址（HTTP POST，默认打 push-relay）\n"
+           "  --push-now    只推一条测试消息然后退出（验证 push-url 通不通）\n"
            "  --no-watch    不核盘、不推「下载完成 / 文件不在了」（默认核）\n",
            argv0);
 }
@@ -2544,7 +2594,7 @@ int main(int argc, char **argv)
 {
     int i;
     int fd, on = 1;
-    int do_selftest = 0, do_init = 0, do_pending_off = 0;
+    int do_selftest = 0, do_init = 0, do_pending_off = 0, do_push_now = 0;
     struct sockaddr_in addr;
     const char *env;
     pthread_t th;
@@ -2577,6 +2627,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--init"))                  do_init = 1;
         else if (!strcmp(argv[i], "--pending-off"))           do_pending_off = 1;
         else if (!strcmp(argv[i], "--selftest"))              do_selftest = 1;
+        else if (!strcmp(argv[i], "--push-now"))              do_push_now = 1;
         else if (!strcmp(argv[i], "-v"))                      g_verbose = 1;
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
     }
@@ -2616,6 +2667,12 @@ int main(int argc, char **argv)
         if (n < 0) { fprintf(stderr, "改库失败（%s 能写吗）\n", g_db); return 1; }
         printf("改成不下的条目：%d 条\n", n);
         return 0;
+    }
+    /* 自检：只推一条就走，用来验证 push-url 通不通 */
+    if (do_push_now) {
+        int ok = push_text("steward 自检：推送链路已通");
+        printf("推送%s -> %s\n", ok ? "成功" : "失败", g_push_url[0] ? g_push_url : "(没配 push-url)");
+        return ok ? 0 : 1;
     }
 
     if (!realpath(g_root, g_root_real)) {

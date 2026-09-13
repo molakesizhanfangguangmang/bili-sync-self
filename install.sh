@@ -6,6 +6,7 @@
 #   FLOOR=10 PUSH_URL=http://10.0.0.9:8310/ ./install.sh
 #   WATCH=0 ./install.sh          # 关掉核盘推送（默认开）
 #   CONTAINER=bili-sync-rs DB=/app/.config/bili-sync/data.sqlite ROOT=/downloads ./install.sh
+#   FETCH=0 ./install.sh          # 不取现成二进制，只用 dist/steward（自己编的或手工放的）
 #
 # 装进的是容器里那个 bind mount 目录（/app/.config/bili-sync），所以：
 #   · 文件在宿主上，容器重建不丢，不用重新拷；
@@ -29,9 +30,57 @@ LEGACY=${LEGACY:-/app/.config/bili-sync/fileview}
 OWNER=${OWNER:-1000:1001}
 SRC=$(cd "$(dirname "$0")" && pwd)
 TMP=${TMPDIR:-/tmp}/steward.env.$$
+REPO=${REPO:-molakesizhanfangguangmang/bili-sync-steward}
+VERSION=${VERSION:-1.0.2}
+FETCH=${FETCH:-1}
+
+# 仓里没有二进制时按本机架构去 release 取一份。取的是静态单文件，校验过 SHA256 才用。
+if [ ! -f "$SRC/dist/steward" ] && [ "$FETCH" != "0" ]; then
+    case "$(uname -m)" in
+        aarch64|arm64) ARCH=aarch64 ;;
+        x86_64|amd64)  ARCH=x86_64 ;;
+        *)             ARCH= ;;
+    esac
+    FILE="steward-v$VERSION-$ARCH"
+    BASE="https://github.com/$REPO/releases/download/v$VERSION"
+
+    if [ -z "$ARCH" ]; then
+        cat >&2 <<EOF
+本机架构 $(uname -m) 没有现成的二进制。自行编译，或去
+    $BASE
+下一份对应架构的，改名放进 $SRC/dist/steward（或显式给 ARCH=架构名）。
+EOF
+        exit 1
+    fi
+    if command -v curl >/dev/null 2>&1; then
+        DL="curl -fsSL -o"
+    elif command -v wget >/dev/null 2>&1; then
+        DL="wget -qO"
+    else
+        echo "没有 curl 也没有 wget，取不了 $FILE。去 $BASE 手动下载后放进 $SRC/dist/steward。" >&2
+        exit 1
+    fi
+
+    echo "[0/5] 本地没有 dist/steward，取 $FILE"
+    mkdir -p "$SRC/dist"
+    # shellcheck disable=SC2086
+    $DL "$SRC/dist/steward" "$BASE/$FILE"
+    chmod 755 "$SRC/dist/steward"
+
+    if SUMFILE=${TMPDIR:-/tmp}/SHA256SUMS.$$; $DL "$SUMFILE" "$BASE/SHA256SUMS" 2>/dev/null; then
+        want=$(awk -v f="$FILE" '$2 == f { print $1 }' "$SUMFILE")
+        got=$(sha256sum "$SRC/dist/steward" 2>/dev/null | awk '{ print $1 }')
+        rm -f "$SUMFILE"
+        if [ -n "$want" ] && [ "$want" != "$got" ]; then
+            echo "SHA256 对不上（清单 $want，实际 $got），已删掉取回来的文件。" >&2
+            rm -f "$SRC/dist/steward"
+            exit 1
+        fi
+    fi
+fi
 
 if [ ! -f "$SRC/dist/steward" ]; then
-    echo "没有 $SRC/dist/steward，先跑 ./build.sh" >&2
+    echo "没有 $SRC/dist/steward。跑 ./build.sh 自己编，或去掉 FETCH=0 让脚本去取。" >&2
     exit 1
 fi
 

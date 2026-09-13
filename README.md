@@ -14,7 +14,7 @@
 └── /app/.config/bili-sync/               ← bind mount，重建容器也不丢
     ├── data.sqlite                       上游的库（这里读写）
     ├── steward/                          注入的这一件
-    │   ├── steward                       aarch64 静态二进制（无依赖）
+    │   ├── steward                       静态二进制（无依赖）
     │   ├── run.sh                        常驻包装：挂了重起，日志进 steward.log
     │   ├── steward.env                   参数（端口、阈值、推送地址……）
     │   └── stop.sh
@@ -88,32 +88,48 @@
 
 ## 轻到什么程度
 
-- 产物是静态单文件，aarch64，约 1.8 MB：SQLite amalgamation 链进去，运行时零依赖。目标容器里没有 python / node / curl，也不需要。
+- 产物是静态单文件，约 1.8 MB：SQLite amalgamation 链进去，运行时零依赖。目标容器里没有 python / node / curl，也不需要。
 - 没有 Dockerfile、没有自己的镜像、没有常驻依赖。装进去的东西就是三个文件加一个二进制，全在 bind mount 里，容器重建不用重装。
 - 前端是一张内嵌的 HTML（约 45 KB，无外部资源、无框架），页面每次请求现算。
 - 除了 GNU libc 和 SQLite（公有领域），没有第三方代码。
 
 ## 编译
 
-在 aarch64 机器上：
+需要 gcc 与 python3，无其它依赖：
 
 ```sh
 ./build.sh          # 产出 dist/steward
 ```
 
-`build.sh` 把 `web/index.html` 嵌成 C 字符串，再和 `vendor/sqlite3.c` 一起静态链接。`sqlite3.c` 单独编且有缓存（RK3566 上 `-O1` 约两分钟），之后改前端或改 `steward.c` 是秒级重编。跨架构就 `CC=aarch64-linux-gnu-gcc ./build.sh`。
+`build.sh` 把 `web/index.html` 嵌成 C 字符串，再和 `vendor/sqlite3.c` 一起静态链接。`sqlite3.c` 单独编且有缓存（RK3566 上 `-O1` 约两分钟），之后改前端或改 `steward.c` 是秒级重编。脚本认 `CC`，跨架构写 `CC=aarch64-linux-gnu-gcc ./build.sh`。
 
-不想自己编：去 [Releases](../../releases) 下 `steward-v1.0.1-aarch64`，放到 `dist/steward`（`install.sh` 认这个位置），然后直接跑安装。
+`aarch64` 与 `x86_64` 两套成品在打 tag 时由 GitHub Actions 各编一份（`.github/workflows/release.yml`），随 release 一起发布，不必自己动手。
 
 ## 安装
 
-需要 docker 权限（在能跑 docker 的账号下执行）：
+需要 docker 权限（在能跑 docker 的账号下执行）。两条路等价，任选一条：
+
+```sh
+# 一、从仓库装。仓里没有二进制时，脚本按 uname -m 去 Releases 取对应架构的那份
+git clone https://github.com/molakesizhanfangguangmang/bili-sync-steward.git
+cd bili-sync-steward && ./install.sh
+
+# 二、从 Releases 下完整包
+tar xzf steward-v1.0.2-x86_64.tar.gz
+cd steward-v1.0.2-x86_64 && ./install.sh
+```
+
+认得的架构是 `aarch64`（`uname -m` 报 `aarch64` 或 `arm64`）与 `x86_64`（报 `x86_64` 或 `amd64`）；按的是 bili-sync 容器所在机器。取回来的文件在写入前照 `SHA256SUMS` 校验一次。两条路都可以绕开取货：自己 `./build.sh` 编好，或手工把二进制放到 `dist/steward`，再跑 `FETCH=0 ./install.sh`。
+
+参数：
 
 ```sh
 ./install.sh                                  # 默认容器 bili-sync-rs、端口 12346、阈值 10%
-PORT=12346 FLOOR=10 ./install.sh               # 显式给
+PORT=12346 FLOOR=10 ./install.sh              # 显式给
 TOKEN=随便一串 ./install.sh                    # 开 token 校验
 PUSH_URL=http://10.0.0.9:8000/hook ./install.sh  # 拉闸时往这儿推
+FETCH=0 ./install.sh                          # 只用本地 dist/steward，不联网取
+VERSION=1.0.1 ./install.sh                    # 取指定版本（默认 1.0.2）
 ```
 
 它做五件事：把二进制和三个 sh 拷进容器、停掉上一份、建触发器并给空规则的源补默认规则（`--init`，幂等）、`docker exec -d` 起进程、容器内自检 `/healthz`。参数写进 `steward.env`（0600），所以容器重建后手敲一条命令也能按原参数起来：
@@ -161,7 +177,6 @@ docker exec bili-sync-rs /app/.config/bili-sync/steward/steward --db /app/.confi
 - 页面是 bili-sync 原生界面外头独立一站；上游自己的「视频」页不会有角标。
 - 状态每次请求现算（一千多条记录约 1–2 秒），没做缓存。
 - 目录结构按「一个视频一个文件夹、分页 mp4 在文件夹里」这一种布局判定。保存路径模板换花样（比如把视频直接摊在源目录下）会扫不到。
-- 只编了 aarch64 静态二进制；别的架构自己编。
 - 闸门只在 steward 活着的时候工作。容器停着的时候它也不在，但那种时候也没人在下载。
 
 ## 接口

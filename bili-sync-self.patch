@@ -17,7 +17,7 @@ index fca8ba2..a07b6af 100644
  pub struct ResetFilteredVideoStatusRequest {
      pub collection: Option<i32>,
 diff --git a/crates/bili_sync/src/api/response.rs b/crates/bili_sync/src/api/response.rs
-index 44ee854..b57e5ae 100644
+index 44ee854..8dd1ea8 100644
 --- a/crates/bili_sync/src/api/response.rs
 +++ b/crates/bili_sync/src/api/response.rs
 @@ -17,10 +17,41 @@ pub struct VideoSourcesResponse {
@@ -63,7 +63,7 @@ index 44ee854..b57e5ae 100644
  #[derive(Serialize)]
  pub struct VideoResponse {
      pub video: VideoInfo,
-@@ -67,7 +98,7 @@ pub struct VideoSource {
+@@ -67,13 +98,15 @@ pub struct VideoSource {
      pub name: String,
  }
  
@@ -72,7 +72,15 @@ index 44ee854..b57e5ae 100644
  #[sea_orm(entity = "video::Entity")]
  pub struct VideoInfo {
      pub id: i32,
-@@ -193,6 +224,16 @@ pub struct DashBoardResponse {
+     pub bvid: String,
+     pub name: String,
+     pub upper_name: String,
++    /// 封面地址（B 站 CDN，列表/详情直接拿它当 <img> 用，前端要带 no-referrer）
++    pub cover: String,
+     pub valid: bool,
+     pub should_download: bool,
+     #[serde(serialize_with = "serde_video_download_status")]
+@@ -193,6 +226,16 @@ pub struct DashBoardResponse {
      pub enabled_submissions: u64,
      pub enable_watch_later: bool,
      pub videos_by_day: Vec<DayCountPair>,
@@ -89,7 +97,7 @@ index 44ee854..b57e5ae 100644
  }
  
  #[derive(Serialize, Clone, Copy)]
-@@ -205,6 +246,10 @@ pub struct SysInfo {
+@@ -205,6 +248,10 @@ pub struct SysInfo {
      pub process_cpu: f32,
      pub total_disk: u64,
      pub available_disk: u64,
@@ -266,7 +274,7 @@ index 061bdd7..c188663 100644
              .merge(task::router())
              .layer(middleware::from_fn(auth)),
 diff --git a/crates/bili_sync/src/api/routes/videos/mod.rs b/crates/bili_sync/src/api/routes/videos/mod.rs
-index f779f71..a5da405 100644
+index f779f71..251dc57 100644
 --- a/crates/bili_sync/src/api/routes/videos/mod.rs
 +++ b/crates/bili_sync/src/api/routes/videos/mod.rs
 @@ -10,27 +10,37 @@ use sea_orm::ActiveValue::Set;
@@ -313,7 +321,7 @@ index f779f71..a5da405 100644
          .route(
              "/videos/{id}/clear-and-reset-status",
              post(clear_and_reset_video_status),
-@@ -41,6 +51,53 @@ pub(super) fn router() -> Router {
+@@ -41,6 +51,54 @@ pub(super) fn router() -> Router {
          .route("/videos/update-status", post(update_filtered_video_status))
  }
  
@@ -323,6 +331,7 @@ index f779f71..a5da405 100644
 +        bvid: video_model.bvid.clone(),
 +        name: video_model.name.clone(),
 +        upper_name: video_model.upper_name.clone(),
++        cover: video_model.cover.clone(),
 +        valid: video_model.valid,
 +        should_download: video_model.should_download,
 +        download_status: video_model.download_status,
@@ -367,7 +376,7 @@ index f779f71..a5da405 100644
  fn apply_created_at_filter(
      mut query: Select<video::Entity>,
      created_from: Option<NaiveDateTime>,
-@@ -61,7 +118,11 @@ fn apply_created_at_filter(
+@@ -61,7 +119,11 @@ fn apply_created_at_filter(
      query
  }
  
@@ -380,7 +389,7 @@ index f779f71..a5da405 100644
  pub async fn get_videos(
      Extension(db): Extension<DatabaseConnection>,
      Query(params): Query<VideosRequest>,
-@@ -91,21 +152,89 @@ pub async fn get_videos(
+@@ -91,21 +153,89 @@ pub async fn get_videos(
          query = query.filter(validation_filter.to_video_query());
      }
      query = apply_created_at_filter(query, params.created_from, params.created_to);
@@ -476,7 +485,7 @@ index f779f71..a5da405 100644
  }
  
  pub async fn get_video(
-@@ -129,6 +258,63 @@ pub async fn get_video(
+@@ -129,6 +259,63 @@ pub async fn get_video(
      }))
  }
  
@@ -540,7 +549,7 @@ index f779f71..a5da405 100644
  pub async fn reset_video_status(
      Path(id): Path<i32>,
      Extension(db): Extension<DatabaseConnection>,
-@@ -192,46 +378,10 @@ pub async fn clear_and_reset_video_status(
+@@ -192,46 +379,10 @@ pub async fn clear_and_reset_video_status(
      Path(id): Path<i32>,
      Extension(db): Extension<DatabaseConnection>,
  ) -> Result<ApiResponse<ClearAndResetVideoStatusResponse>, ApiError> {
@@ -1180,10 +1189,10 @@ index 7045931..769e4d8 100644
  			},
  			{
 diff --git a/web/src/lib/components/video-card.svelte b/web/src/lib/components/video-card.svelte
-index cd79780..e0827e8 100644
+index cd79780..e710668 100644
 --- a/web/src/lib/components/video-card.svelte
 +++ b/web/src/lib/components/video-card.svelte
-@@ -6,15 +6,18 @@
+@@ -6,15 +6,19 @@
  	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
  	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
  	import { Label } from '$lib/components/ui/label/index.js';
@@ -1197,13 +1206,14 @@ index cd79780..e0827e8 100644
 +	import FoldersIcon from '@lucide/svelte/icons/folders';
  	import HeartIcon from '@lucide/svelte/icons/heart';
  	import InfoIcon from '@lucide/svelte/icons/info';
++	import ImageOffIcon from '@lucide/svelte/icons/image-off';
  	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
  	import SquareArrowOutUpRightIcon from '@lucide/svelte/icons/square-arrow-out-up-right';
 +	import SquarePenIcon from '@lucide/svelte/icons/square-pen';
  	import UserIcon from '@lucide/svelte/icons/user';
  	import { goto } from '$app/navigation';
  	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
-@@ -22,6 +25,7 @@
+@@ -22,6 +26,7 @@
  	// 将 bvid 设置为可选属性，但保留 VideoInfo 的其它所有属性
  	export let video: Omit<VideoInfo, 'bvid'> & { bvid?: string };
  	export let source: { type: string; name: string } | null = null; // 视频源信息
@@ -1211,7 +1221,7 @@ index cd79780..e0827e8 100644
  	export let showActions: boolean = true; // 控制是否显示操作按钮
  	export let mode: 'default' | 'detail' | 'page' = 'default'; // 卡片模式
  	export let customTitle: string = ''; // 自定义标题
-@@ -30,10 +34,15 @@
+@@ -30,10 +35,15 @@
  	export let showProgress: boolean = true; // 是否显示进度信息
  	export let onReset: ((forceReset: boolean) => Promise<void>) | null = null; // 自定义重置函数
  	export let onClearAndReset: (() => Promise<void>) | null = null; // 自定义清空重置函数
@@ -1227,7 +1237,7 @@ index cd79780..e0827e8 100644
  
  	let forceReset = false;
  
-@@ -120,6 +129,35 @@
+@@ -120,10 +130,45 @@
  		clearAndResetDialogOpen = false;
  	}
  
@@ -1263,21 +1273,141 @@ index cd79780..e0827e8 100644
  	function handleViewDetail() {
  		goto(`/video/${video.id}`);
  	}
-@@ -177,6 +215,13 @@
- 				</Badge>
+ 
++	// 封面：库里存的就是 B 站 CDN 地址，直接当 <img> 用。
++	// CDN 见到别的站点的 Referer 会回 403，所以图片必须带 referrerpolicy="no-referrer"；
++	// 取不到（视频被删/网络不通）就落回一个占位方块。
++	let coverFailed = false;
++	$: coverUrl = (video.cover ?? '').replace(/^http:/, 'https:');
++
+ 	// 根据模式确定显示的标题和副标题
+ 	$: displayTitle = customTitle || video.name;
+ 	$: displaySubtitle = customSubtitle || video.upper_name;
+@@ -135,48 +180,83 @@
+ 
+ <Card class={cardClasses}>
+ 	<CardHeader class="shrink-0 pb-1">
+-		<div class="flex min-w-0 items-start justify-between gap-3">
+-			<CardTitle
+-				class="line-clamp-2 min-w-0 flex-1 cursor-default {mode === 'default'
+-					? 'text-sm'
+-					: 'text-sm'} leading-relaxed font-medium"
+-				title={displayTitle}
+-			>
+-				{displayTitle}
+-			</CardTitle>
+-			<Badge
+-				variant="secondary"
+-				class="shrink-0 px-2 py-1 text-xs font-medium {overallStatus.style} "
+-			>
+-				{overallStatus.text}
+-			</Badge>
+-		</div>
+-		{#if displaySubtitle}
+-			<div class="text-muted-foreground mt-1.5 flex min-w-0 items-center gap-1 text-sm">
+-				<UserIcon class="h-3.5 w-3.5 shrink-0" />
+-				<span class="min-w-0 cursor-default truncate" title={displaySubtitle}>
+-					{displaySubtitle}
+-				</span>
+-			</div>
+-		{/if}
+-		{#if source}
+-			<div class="text-muted-foreground mt-2 flex min-w-0 items-center justify-end gap-1 text-sm">
+-				<Badge variant="outline" class="max-w-full shrink px-1.5 py-0.5">
+-					{#if source.type === 'favorite'}
+-						<HeartIcon class="h-3.5 w-3.5 shrink-0" />
+-					{:else if source.type === 'collection'}
+-						<FolderIcon class="h-3.5 w-3.5 shrink-0" />
+-					{:else if source.type === 'submission'}
+-						<UserIcon class="h-3.5 w-3.5 shrink-0" />
+-					{:else if source.type === 'watch_later'}
+-						<ClockIcon class="h-3.5 w-3.5 shrink-0" />
++		<div class="flex min-w-0 items-start gap-3">
++			{#if coverUrl}
++				<div
++					class="bg-muted relative shrink-0 overflow-hidden rounded-md border {mode === 'default'
++						? 'h-[63px] w-[112px]'
++						: 'h-[113px] w-[200px]'}"
++				>
++					{#if coverFailed}
++						<div class="text-muted-foreground flex h-full w-full items-center justify-center">
++							<ImageOffIcon class="h-5 w-5" />
++						</div>
++					{:else}
++						<img
++							src={coverUrl}
++							alt=""
++							loading="lazy"
++							referrerpolicy="no-referrer"
++							class="h-full w-full object-cover"
++							onerror={() => (coverFailed = true)}
++						/>
+ 					{/if}
+-					<span class="min-w-0 truncate" title={source.name}>
+-						{source.name}
+-					</span>
+-				</Badge>
++				</div>
++			{/if}
++			<div class="min-w-0 flex-1">
++				<div class="flex min-w-0 items-start justify-between gap-3">
++					<CardTitle
++						class="line-clamp-2 min-w-0 flex-1 cursor-default {mode === 'default'
++							? 'text-sm'
++							: 'text-sm'} leading-relaxed font-medium"
++						title={displayTitle}
++					>
++						{displayTitle}
++					</CardTitle>
++					<Badge
++						variant="secondary"
++						class="shrink-0 px-2 py-1 text-xs font-medium {overallStatus.style} "
++					>
++						{overallStatus.text}
++					</Badge>
++				</div>
++				{#if displaySubtitle}
++					<div class="text-muted-foreground mt-1.5 flex min-w-0 items-center gap-1 text-sm">
++						<UserIcon class="h-3.5 w-3.5 shrink-0" />
++						<span class="min-w-0 cursor-default truncate" title={displaySubtitle}>
++							{displaySubtitle}
++						</span>
++					</div>
++				{/if}
++				{#if source}
++					<div
++						class="text-muted-foreground mt-2 flex min-w-0 items-center justify-end gap-1 text-sm"
++					>
++						<Badge variant="outline" class="max-w-full shrink px-1.5 py-0.5">
++							{#if source.type === 'favorite'}
++								<HeartIcon class="h-3.5 w-3.5 shrink-0" />
++							{:else if source.type === 'collection'}
++								<FolderIcon class="h-3.5 w-3.5 shrink-0" />
++							{:else if source.type === 'submission'}
++								<UserIcon class="h-3.5 w-3.5 shrink-0" />
++							{:else if source.type === 'watch_later'}
++								<ClockIcon class="h-3.5 w-3.5 shrink-0" />
++							{/if}
++							<span class="min-w-0 truncate" title={source.name}>
++								{source.name}
++							</span>
++						</Badge>
++					</div>
++				{/if}
++				{#if sourceCount && sourceCount > 1 && video.bvid}
++					<div class="text-muted-foreground mt-1.5 flex min-w-0 items-center gap-1 text-xs">
++						<FoldersIcon class="h-3 w-3 shrink-0" />
++						<span class="cursor-default font-mono" title={video.bvid}>{video.bvid}</span>
++						<span class="shrink-0">· 共 {sourceCount} 个来源，只下一份</span>
++					</div>
++				{/if}
  			</div>
- 		{/if}
-+		{#if sourceCount && sourceCount > 1 && video.bvid}
-+			<div class="text-muted-foreground mt-1.5 flex min-w-0 items-center gap-1 text-xs">
-+				<FoldersIcon class="h-3 w-3 shrink-0" />
-+				<span class="cursor-default font-mono" title={video.bvid}>{video.bvid}</span>
-+				<span class="shrink-0">· 共 {sourceCount} 个来源，只下一份</span>
-+			</div>
-+		{/if}
+-		{/if}
++		</div>
  	</CardHeader>
  	<CardContent
  		class={mode === 'default' ? 'flex min-w-0 flex-1 flex-col justify-end pt-0 pb-3' : 'pt-0 pb-4'}
-@@ -222,6 +267,17 @@
+@@ -222,6 +302,17 @@
  						<span class="truncate">详情</span>
  					</Button>
  
@@ -1295,7 +1425,7 @@ index cd79780..e0827e8 100644
  					<DropdownMenu.Root>
  						<DropdownMenu.Trigger>
  							{#snippet child({ props })}
-@@ -236,6 +292,10 @@
+@@ -236,6 +327,10 @@
  							{/snippet}
  						</DropdownMenu.Trigger>
  						<DropdownMenu.Content align="start" class="w-48">
@@ -1306,7 +1436,7 @@ index cd79780..e0827e8 100644
  							<DropdownMenu.Item class="cursor-pointer" onclick={() => (resetDialogOpen = true)}>
  								<RotateCcwIcon class="mr-2 h-4 w-4" />
  								重置
-@@ -309,6 +369,39 @@
+@@ -309,6 +404,39 @@
  	</AlertDialog.Content>
  </AlertDialog.Root>
  
@@ -1347,10 +1477,19 @@ index cd79780..e0827e8 100644
  <AlertDialog.Root bind:open={clearAndResetDialogOpen}>
  	<AlertDialog.Content>
 diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
-index ff76d6c..f02ecdc 100644
+index ff76d6c..2cf4e97 100644
 --- a/web/src/lib/types.ts
 +++ b/web/src/lib/types.ts
-@@ -43,8 +43,16 @@ export interface VideoInfo {
+@@ -34,6 +34,8 @@ export interface VideoInfo {
+ 	bvid: string;
+ 	name: string;
+ 	upper_name: string;
++	/** 封面地址（B 站 CDN），列表/详情用它渲染缩略图 */
++	cover?: string;
+ 	valid: boolean;
+ 	should_download: boolean;
+ 	download_status: [number, number, number, number, number];
+@@ -43,8 +45,16 @@ export interface VideoInfo {
  	watch_later_id?: number;
  }
  
@@ -1368,7 +1507,7 @@ index ff76d6c..f02ecdc 100644
  	total_count: number;
  }
  
-@@ -71,6 +79,20 @@ export interface ClearAndResetVideoResponse {
+@@ -71,6 +81,20 @@ export interface ClearAndResetVideoResponse {
  	video: VideoInfo;
  }
  
@@ -1389,7 +1528,7 @@ index ff76d6c..f02ecdc 100644
  export interface ResetFilteredVideosResponse {
  	resetted: boolean;
  	resetted_videos_count: number;
-@@ -384,6 +406,15 @@ export interface DashBoardResponse {
+@@ -384,6 +408,15 @@ export interface DashBoardResponse {
  	enabled_submissions: number;
  	enable_watch_later: boolean;
  	videos_by_day: DayCountPair[];
@@ -1405,7 +1544,7 @@ index ff76d6c..f02ecdc 100644
  }
  
  export interface SysInfo {
-@@ -396,6 +427,8 @@ export interface SysInfo {
+@@ -396,6 +429,8 @@ export interface SysInfo {
  	total_disk: number;
  	used_disk: number;
  	available_disk: number;
@@ -2600,6 +2739,176 @@ index 0000000..f7565f8
 +		class="bg-background h-[calc(100vh-7rem)] w-full rounded-lg border"
 +	></iframe>
 +{/if}
+diff --git a/web/src/routes/video/[id]/+page.svelte b/web/src/routes/video/[id]/+page.svelte
+index 38e429b..12ffc3a 100644
+--- a/web/src/routes/video/[id]/+page.svelte
++++ b/web/src/routes/video/[id]/+page.svelte
+@@ -3,10 +3,17 @@
+ 	import { goto } from '$app/navigation';
+ 	import { onMount } from 'svelte';
+ 	import { Button } from '$lib/components/ui/button/index.js';
++	import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
+ 	import api from '$lib/api';
+ 	import SquareArrowOutUpRightIcon from '@lucide/svelte/icons/square-arrow-out-up-right';
+-	import type { ApiError, VideoResponse, UpdateVideoStatusRequest } from '$lib/types';
++	import type {
++		ApiError,
++		DownloadVideoStatus,
++		VideoResponse,
++		UpdateVideoStatusRequest
++	} from '$lib/types';
+ 	import BrushCleaningIcon from '@lucide/svelte/icons/brush-cleaning';
++	import DownloadIcon from '@lucide/svelte/icons/download';
+ 	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
+ 	import SquarePenIcon from '@lucide/svelte/icons/square-pen';
+ 	import { setBreadcrumb } from '$lib/stores/breadcrumb';
+@@ -24,15 +31,19 @@
+ 	let clearAndResetting = false;
+ 	let statusEditorOpen = false;
+ 	let statusEditorLoading = false;
++	let downloadDialogOpen = false;
++	let downloading = false;
+ 
+-	async function loadVideoDetail() {
++	async function loadVideoDetail(silent = false) {
+ 		const videoId = parseInt($page.params.id!);
+ 		if (isNaN(videoId)) {
+ 			error = '无效的视频 ID';
+ 			toast.error('无效的视频 ID');
+ 			return;
+ 		}
+-		loading = true;
++		if (!silent) {
++			loading = true;
++		}
+ 		error = null;
+ 		try {
+ 			const result = await api.getVideo(videoId);
+@@ -140,6 +151,67 @@
+ 			});
+ 		}
+ 	}
++
++	// 立即下载：先不带覆盖试一次，库里已经有完成的一份时后端回 already_exists，这里再问一句
++	async function handleDownloadNow() {
++		if (!videoData) return;
++		downloading = true;
++		try {
++			const status = await requestDownload(false);
++			if (status === 'already_exists') {
++				downloadDialogOpen = true;
++			}
++		} finally {
++			downloading = false;
++		}
++	}
++
++	async function handleDownloadOverwrite() {
++		if (!videoData) return;
++		downloading = true;
++		try {
++			await requestDownload(true);
++		} finally {
++			downloading = false;
++			downloadDialogOpen = false;
++		}
++	}
++
++	async function requestDownload(overwrite: boolean): Promise<DownloadVideoStatus | 'error'> {
++		if (!videoData) return 'error';
++		try {
++			const result = await api.downloadVideoNow(videoData.video.id, { overwrite });
++			const data = result.data;
++			if (data.status === 'already_exists') {
++				return 'already_exists';
++			}
++			if (data.status === 'invalid') {
++				toast.info('视频已失效', {
++					description: `视频「${data.video.name}」已失效，不下载`
++				});
++				return 'invalid';
++			}
++			if (data.warning) {
++				toast.warning('已加入下载队列', {
++					description: data.warning
++				});
++			} else {
++				toast.success('已加入下载队列', {
++					description: overwrite
++						? `视频「${data.video.name}」已清空重置并重新加入下载队列`
++						: `视频「${data.video.name}」已加入下载队列，跟着队列顺序下`
++				});
++			}
++			await loadVideoDetail(true);
++			return 'enqueued';
++		} catch (error) {
++			console.error('加入下载队列失败：', error);
++			toast.error('加入下载队列失败', {
++				description: (error as ApiError).message
++			});
++			return 'error';
++		}
++	}
+ </script>
+ 
+ <svelte:head>
+@@ -168,6 +240,16 @@
+ 		<div class="mb-4 flex items-center justify-between">
+ 			<h2 class="text-xl font-semibold">视频信息</h2>
+ 			<div class="flex gap-2">
++				<Button
++					size="sm"
++					variant="outline"
++					class="shrink-0 cursor-pointer "
++					onclick={handleDownloadNow}
++					disabled={downloading}
++				>
++					<DownloadIcon class="mr-2 h-4 w-4" />
++					{downloading ? '处理中' : '立即下载'}
++				</Button>
+ 				<Button
+ 					size="sm"
+ 					variant="outline"
+@@ -270,6 +352,39 @@
+ 		{/if}
+ 	</section>
+ 
++	<!-- 立即下载：已经存在时的覆盖确认框 -->
++	<AlertDialog.Root bind:open={downloadDialogOpen}>
++		<AlertDialog.Content>
++			<AlertDialog.Header>
++				<AlertDialog.Title>重新下载并覆盖</AlertDialog.Title>
++				<AlertDialog.Description>
++					视频 <strong>"{videoData.video.name}"</strong> 已经存在（同一个 bvid
++					的其它来源里已经下过，或本地已有完成的一份）。
++					<br />
++					<br />
++					继续会：
++					<ul class="mt-2 ml-4 list-disc space-y-1">
++						<li class="text-destructive font-medium">删除该视频对应的文件夹（清空重置）</li>
++						<li>重新下载这一条（重复的来源不会各下一份）</li>
++					</ul>
++					<br />
++					此操作<span class="text-destructive font-medium">无法撤销</span>。
++				</AlertDialog.Description>
++			</AlertDialog.Header>
++
++			<AlertDialog.Footer>
++				<AlertDialog.Cancel>取消</AlertDialog.Cancel>
++				<AlertDialog.Action
++					onclick={handleDownloadOverwrite}
++					disabled={downloading}
++					class="bg-destructive hover:bg-destructive/90"
++				>
++					{downloading ? '处理中...' : '重新下载并覆盖'}
++				</AlertDialog.Action>
++			</AlertDialog.Footer>
++		</AlertDialog.Content>
++	</AlertDialog.Root>
++
+ 	<!-- 状态编辑器 -->
+ 	{#if videoData}
+ 		<StatusEditor
 diff --git a/web/src/routes/videos/+page.svelte b/web/src/routes/videos/+page.svelte
 index ec98bde..e35da8a 100644
 --- a/web/src/routes/videos/+page.svelte

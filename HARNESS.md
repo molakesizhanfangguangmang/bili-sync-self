@@ -31,6 +31,12 @@
   行内「立即下载」按钮（点到已经存在的会弹「重新下载并覆盖」确认框），「⋯」菜单里加「状态编辑」
   （复用详情页那套 Sheet 编辑器；列表行没有分页信息，打开前多取一次 `GET /api/videos/{id}`）。
   默认视图下同一个 bvid 折成一条，卡片上多印一行 bvid + 来源数
+- `web/src/routes/video/[id]/+page.svelte`：详情页加行内「立即下载」按钮，行为与列表行一致
+  （已经存在 → 「重新下载并覆盖」确认框；已失效只提示不下载），复用 `POST /api/videos/{id}/download`
+- `web/src/lib/components/video-card.svelte`：卡片头部加封面缩略图（列表 112×63、详情 200×113），
+  取 `<video.cover>` 的 B 站 CDN 直链，挂 `referrerpolicy="no-referrer"` 并把 `http://` 归一为 `https://`
+  （实测该 CDN 认 Referer：带外站 Referer 403、不带 200），取图失败落 `ImageOff` 占位；
+  详情页复用 `VideoCard mode="detail"`，一处改动两处生效
 - `web/src/lib/api.ts`、`web/src/lib/types.ts`：加 `/dashboard-layout` 的读写方法与类型、
   `/videos/{id}/download` 的方法与类型；`SysInfo` 加 `net_rx_speed` / `net_tx_speed`；
   `DashBoardResponse` 加队列与总账几个计数；`VideoListItem`（`VideoInfo` + `source_count`）
@@ -52,7 +58,8 @@
   等正在跑的那轮结束后按顺序下
 - `workflow.rs`：`download_single_video()` 手动单条下载（缺分页时先补一次详情）；
   `process_video_source()` / `download_unprocessed_videos()` 多带一个 `duplicated_video_ids` 过滤候选
-- `api/request.rs`、`api/response.rs`：`DownloadVideoRequest`、`VideoListItem`、`DownloadVideoResponse`
+- `api/request.rs`、`api/response.rs`：`DownloadVideoRequest`、`VideoListItem`、`DownloadVideoResponse`；
+  `VideoInfo` 加 `cover`（`video.cover` 就是 B 站 CDN 地址，无需刮削，前端直接当 `<img src>`）
 
 去重只作用在**下载候选**与**列表展示**两处：不改 `data.sqlite` 表结构、不加列、无迁移，
 也不动管道/通知逻辑。折叠只在默认视图生效，切到单源筛选仍逐条显示。

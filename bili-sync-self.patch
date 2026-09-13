@@ -266,21 +266,11 @@ index 061bdd7..c188663 100644
              .merge(task::router())
              .layer(middleware::from_fn(auth)),
 diff --git a/crates/bili_sync/src/api/routes/videos/mod.rs b/crates/bili_sync/src/api/routes/videos/mod.rs
-index f779f71..decdcd9 100644
+index f779f71..a5da405 100644
 --- a/crates/bili_sync/src/api/routes/videos/mod.rs
 +++ b/crates/bili_sync/src/api/routes/videos/mod.rs
-@@ -1,5 +1,3 @@
--use std::collections::HashSet;
--
- use anyhow::{Context, Result};
- use axum::extract::{Extension, Path, Query};
- use axum::routing::{get, post};
-@@ -7,30 +5,40 @@ use axum::{Json, Router};
- use bili_sync_entity::*;
- use chrono::NaiveDateTime;
- use sea_orm::ActiveValue::Set;
--use sea_orm::sea_query::{Expr, ExprTrait};
-+use sea_orm::sea_query::Expr;
+@@ -10,27 +10,37 @@ use sea_orm::ActiveValue::Set;
+ use sea_orm::sea_query::{Expr, ExprTrait};
  use sea_orm::{
      ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter,
 -    QueryOrder, Select, TransactionTrait, TryIntoModel,
@@ -323,7 +313,7 @@ index f779f71..decdcd9 100644
          .route(
              "/videos/{id}/clear-and-reset-status",
              post(clear_and_reset_video_status),
-@@ -41,6 +49,53 @@ pub(super) fn router() -> Router {
+@@ -41,6 +51,53 @@ pub(super) fn router() -> Router {
          .route("/videos/update-status", post(update_filtered_video_status))
  }
  
@@ -377,7 +367,7 @@ index f779f71..decdcd9 100644
  fn apply_created_at_filter(
      mut query: Select<video::Entity>,
      created_from: Option<NaiveDateTime>,
-@@ -61,7 +116,11 @@ fn apply_created_at_filter(
+@@ -61,7 +118,11 @@ fn apply_created_at_filter(
      query
  }
  
@@ -390,7 +380,7 @@ index f779f71..decdcd9 100644
  pub async fn get_videos(
      Extension(db): Extension<DatabaseConnection>,
      Query(params): Query<VideosRequest>,
-@@ -91,21 +150,89 @@ pub async fn get_videos(
+@@ -91,21 +152,89 @@ pub async fn get_videos(
          query = query.filter(validation_filter.to_video_query());
      }
      query = apply_created_at_filter(query, params.created_from, params.created_to);
@@ -486,7 +476,7 @@ index f779f71..decdcd9 100644
  }
  
  pub async fn get_video(
-@@ -129,6 +256,63 @@ pub async fn get_video(
+@@ -129,6 +258,63 @@ pub async fn get_video(
      }))
  }
  
@@ -550,7 +540,7 @@ index f779f71..decdcd9 100644
  pub async fn reset_video_status(
      Path(id): Path<i32>,
      Extension(db): Extension<DatabaseConnection>,
-@@ -192,46 +376,10 @@ pub async fn clear_and_reset_video_status(
+@@ -192,46 +378,10 @@ pub async fn clear_and_reset_video_status(
      Path(id): Path<i32>,
      Extension(db): Extension<DatabaseConnection>,
  ) -> Result<ApiResponse<ClearAndResetVideoStatusResponse>, ApiError> {
@@ -692,7 +682,7 @@ index def0634..c50ab48 100644
 +    (0, 0)
 +}
 diff --git a/crates/bili_sync/src/task/video_downloader.rs b/crates/bili_sync/src/task/video_downloader.rs
-index 1ba8051..a8e2114 100644
+index 1ba8051..1f2a3a2 100644
 --- a/crates/bili_sync/src/task/video_downloader.rs
 +++ b/crates/bili_sync/src/task/video_downloader.rs
 @@ -11,9 +11,9 @@ use tokio_cron_scheduler::{Job, JobScheduler};
@@ -746,7 +736,7 @@ index 1ba8051..a8e2114 100644
          });
          // 读取初始配置
          let mut rx = VersionedConfig::get().subscribe();
-@@ -263,6 +281,48 @@ impl DownloadTaskManager {
+@@ -263,6 +281,49 @@ impl DownloadTaskManager {
          }
      }
  
@@ -765,7 +755,8 @@ index 1ba8051..a8e2114 100644
 +                let config = VersionedConfig::get().snapshot();
 +                info!("开始执行手动下载任务（{} 个视频）..", pending.len());
 +                let result = async {
-+                    let bili_client = cx.bili_client.snapshot().context("获取 BiliClient 失败")?;
++                    // 和整轮下载一样，先给 BiliClient 打个快照，让限流器在本轮内固定不变
++                    let bili_client = cx.bili_client.snapshot()?;
 +                    for video_id in pending {
 +                        match download_single_video(video_id, &bili_client, &cx.connection, &config).await {
 +                            Ok(_) => info!("视频 {} 手动下载完成", video_id),
@@ -795,7 +786,7 @@ index 1ba8051..a8e2114 100644
      fn download_video_task(
          cx: Arc<TaskContext>,
      ) -> impl FnMut(uuid::Uuid, JobScheduler) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-@@ -357,9 +417,22 @@ async fn download_video(
+@@ -357,9 +418,22 @@ async fn download_video(
      if video_sources.is_empty() {
          bail!("没有可用的视频源");
      }
@@ -940,7 +931,7 @@ index 5542748..0fbab10 100644
  pub async fn create_videos(
      videos_info: Vec<VideoInfo>,
 diff --git a/crates/bili_sync/src/workflow.rs b/crates/bili_sync/src/workflow.rs
-index a0d9d46..c2be820 100644
+index a0d9d46..da83a81 100644
 --- a/crates/bili_sync/src/workflow.rs
 +++ b/crates/bili_sync/src/workflow.rs
 @@ -2,7 +2,7 @@ use std::collections::HashSet;
@@ -952,7 +943,13 @@ index a0d9d46..c2be820 100644
  use bili_sync_entity::upper_vec::Upper;
  use bili_sync_entity::*;
  use futures::stream::{self, FuturesUnordered};
-@@ -15,7 +15,7 @@ use tokio::fs;
+@@ -10,12 +10,12 @@ use futures::{Stream, StreamExt, TryStreamExt};
+ use sea_orm::ActiveValue::Set;
+ use sea_orm::entity::prelude::*;
+ use sea_orm::sea_query::{Alias, ExprTrait, Func};
+-use sea_orm::{IntoSimpleExpr, TransactionTrait};
++use sea_orm::{IntoSimpleExpr, QueryOrder, TransactionTrait};
+ use tokio::fs;
  
  use crate::adapter::{VideoSource, VideoSourceEnum};
  use crate::bilibili::{BestStream, BiliClient, BiliError, Dimension, PageInfo, Video, VideoInfo};

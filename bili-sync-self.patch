@@ -17,10 +17,10 @@ index fca8ba2..a07b6af 100644
  pub struct ResetFilteredVideoStatusRequest {
      pub collection: Option<i32>,
 diff --git a/crates/bili_sync/src/api/response.rs b/crates/bili_sync/src/api/response.rs
-index 44ee854..8dd1ea8 100644
+index 44ee854..62ecc1d 100644
 --- a/crates/bili_sync/src/api/response.rs
 +++ b/crates/bili_sync/src/api/response.rs
-@@ -17,10 +17,41 @@ pub struct VideoSourcesResponse {
+@@ -17,13 +17,66 @@ pub struct VideoSourcesResponse {
  
  #[derive(Serialize)]
  pub struct VideosResponse {
@@ -31,7 +31,8 @@ index 44ee854..8dd1ea8 100644
  
 +/// 视频列表里的一条。默认视图下同一个 bvid 会被折叠成一条，此时 source_count
 +/// 记录折叠了几条（也就是这个视频出现在几个来源里）；按来源筛选时不做折叠，字段缺省。
-+#[derive(Serialize)]
+ #[derive(Serialize)]
+-pub struct VideoResponse {
 +pub struct VideoListItem {
 +    #[serde(flatten)]
 +    pub video: VideoInfo,
@@ -57,13 +58,38 @@ index 44ee854..8dd1ea8 100644
 +    /// 覆盖重下时删文件夹留下的警告
 +    #[serde(skip_serializing_if = "Option::is_none")]
 +    pub warning: Option<String>,
-+    pub video: VideoInfo,
+     pub video: VideoInfo,
 +}
 +
- #[derive(Serialize)]
- pub struct VideoResponse {
-     pub video: VideoInfo,
-@@ -67,13 +98,15 @@ pub struct VideoSource {
++/// 详情页专用的视频信息：在列表共用的 `VideoInfo` 之上，补上库里有、但列表不返回的元数据。
++///
++/// 只给 `GET /api/videos/{id}` 用；列表接口仍然只回 `VideoInfo` —— 一页 20 条不该跟着带上
++/// 整段简介和头像地址。结构体是 flatten 的，前端拿到的是一个平铺对象。
++#[derive(Serialize)]
++pub struct VideoDetailInfo {
++    #[serde(flatten)]
++    pub video: VideoInfo,
++    pub upper_id: i64,
++    /// UP 主头像（B 站 CDN 地址，前端要带 no-referrer）
++    pub upper_face: String,
++    /// 简介（B 站的 desc，纯文本，里面可能有真实换行）
++    pub intro: String,
++    pub pubtime: DateTime,
++    pub ctime: DateTime,
++    pub favtime: DateTime,
++    /// 联合投稿名单，没有就是 null；已经解析成数组，不是 JSON 字符串
++    pub staff: Option<UpperVec>,
++    /// 本地目录，下过的才有内容
++    pub path: String,
++}
++
++#[derive(Serialize)]
++pub struct VideoResponse {
++    pub video: VideoDetailInfo,
+     pub pages: Vec<PageInfo>,
+ }
+ 
+@@ -67,13 +120,15 @@ pub struct VideoSource {
      pub name: String,
  }
  
@@ -80,7 +106,19 @@ index 44ee854..8dd1ea8 100644
      pub valid: bool,
      pub should_download: bool,
      #[serde(serialize_with = "serde_video_download_status")]
-@@ -193,6 +226,16 @@ pub struct DashBoardResponse {
+@@ -93,6 +148,11 @@ pub struct PageInfo {
+     pub name: String,
+     #[serde(serialize_with = "serde_page_download_status")]
+     pub download_status: u32,
++    /// 时长（秒），详情页把各分页加起来用
++    pub duration: u32,
++    /// 分辨率，详情页取首条显示
++    pub width: Option<u32>,
++    pub height: Option<u32>,
+ }
+ 
+ #[derive(Serialize, DerivePartialModel, FromQueryResult, Clone, Copy)]
+@@ -193,6 +253,16 @@ pub struct DashBoardResponse {
      pub enabled_submissions: u64,
      pub enable_watch_later: bool,
      pub videos_by_day: Vec<DayCountPair>,
@@ -97,7 +135,7 @@ index 44ee854..8dd1ea8 100644
  }
  
  #[derive(Serialize, Clone, Copy)]
-@@ -205,6 +248,10 @@ pub struct SysInfo {
+@@ -205,6 +275,10 @@ pub struct SysInfo {
      pub process_cpu: f32,
      pub total_disk: u64,
      pub available_disk: u64,
@@ -274,7 +312,7 @@ index 061bdd7..c188663 100644
              .merge(task::router())
              .layer(middleware::from_fn(auth)),
 diff --git a/crates/bili_sync/src/api/routes/videos/mod.rs b/crates/bili_sync/src/api/routes/videos/mod.rs
-index f779f71..251dc57 100644
+index f779f71..63a1279 100644
 --- a/crates/bili_sync/src/api/routes/videos/mod.rs
 +++ b/crates/bili_sync/src/api/routes/videos/mod.rs
 @@ -10,27 +10,37 @@ use sea_orm::ActiveValue::Set;
@@ -298,7 +336,7 @@ index f779f71..251dc57 100644
 -    VideosResponse,
 +    ClearAndResetVideoStatusResponse, DownloadVideoResponse, DownloadVideoStatus, PageInfo, ResetFilteredVideosResponse,
 +    ResetVideoResponse, SimplePageInfo, SimpleVideoInfo, UpdateFilteredVideoStatusResponse, UpdateVideoStatusResponse,
-+    VideoInfo, VideoListItem, VideoResponse, VideosResponse,
++    VideoDetailInfo, VideoInfo, VideoListItem, VideoResponse, VideosResponse,
  };
  use crate::api::wrapper::{ApiError, ApiResponse, ValidatedJson};
 -use crate::utils::status::{PageStatus, VideoStatus};
@@ -321,7 +359,7 @@ index f779f71..251dc57 100644
          .route(
              "/videos/{id}/clear-and-reset-status",
              post(clear_and_reset_video_status),
-@@ -41,6 +51,54 @@ pub(super) fn router() -> Router {
+@@ -41,6 +51,68 @@ pub(super) fn router() -> Router {
          .route("/videos/update-status", post(update_filtered_video_status))
  }
  
@@ -339,6 +377,20 @@ index f779f71..251dc57 100644
 +        favorite_id: video_model.favorite_id,
 +        submission_id: video_model.submission_id,
 +        watch_later_id: video_model.watch_later_id,
++    }
++}
++
++fn to_video_detail_info(video_model: &video::Model) -> VideoDetailInfo {
++    VideoDetailInfo {
++        video: to_video_info(video_model),
++        upper_id: video_model.upper_id,
++        upper_face: video_model.upper_face.clone(),
++        intro: video_model.intro.clone(),
++        pubtime: video_model.pubtime,
++        ctime: video_model.ctime,
++        favtime: video_model.favtime,
++        staff: video_model.staff.clone(),
++        path: video_model.path.clone(),
 +    }
 +}
 +
@@ -376,7 +428,7 @@ index f779f71..251dc57 100644
  fn apply_created_at_filter(
      mut query: Select<video::Entity>,
      created_from: Option<NaiveDateTime>,
-@@ -61,7 +119,11 @@ fn apply_created_at_filter(
+@@ -61,7 +133,11 @@ fn apply_created_at_filter(
      query
  }
  
@@ -389,7 +441,7 @@ index f779f71..251dc57 100644
  pub async fn get_videos(
      Extension(db): Extension<DatabaseConnection>,
      Query(params): Query<VideosRequest>,
-@@ -91,21 +153,89 @@ pub async fn get_videos(
+@@ -91,44 +167,169 @@ pub async fn get_videos(
          query = query.filter(validation_filter.to_video_query());
      }
      query = apply_created_at_filter(query, params.created_from, params.created_to);
@@ -485,7 +537,27 @@ index f779f71..251dc57 100644
  }
  
  pub async fn get_video(
-@@ -129,6 +259,63 @@ pub async fn get_video(
+     Path(id): Path<i32>,
+     Extension(db): Extension<DatabaseConnection>,
+ ) -> Result<ApiResponse<VideoResponse>, ApiError> {
+-    let (video_info, pages_info) = tokio::try_join!(
+-        video::Entity::find_by_id(id).into_partial_model::<VideoInfo>().one(&db),
++    let (video_model, pages_info) = tokio::try_join!(
++        video::Entity::find_by_id(id).one(&db),
+         page::Entity::find()
+             .filter(page::Column::VideoId.eq(id))
+             .order_by_asc(page::Column::Cid)
+             .into_partial_model::<PageInfo>()
+             .all(&db)
+     )?;
+-    let Some(video_info) = video_info else {
++    let Some(video_model) = video_model else {
+         return Err(InnerApiError::NotFound(id).into());
+     };
+     Ok(ApiResponse::ok(VideoResponse {
+-        video: video_info,
++        video: to_video_detail_info(&video_model),
+         pages: pages_info,
      }))
  }
  
@@ -549,7 +621,7 @@ index f779f71..251dc57 100644
  pub async fn reset_video_status(
      Path(id): Path<i32>,
      Extension(db): Extension<DatabaseConnection>,
-@@ -192,46 +379,10 @@ pub async fn clear_and_reset_video_status(
+@@ -192,46 +393,10 @@ pub async fn clear_and_reset_video_status(
      Path(id): Path<i32>,
      Extension(db): Extension<DatabaseConnection>,
  ) -> Result<ApiResponse<ClearAndResetVideoStatusResponse>, ApiError> {
@@ -1476,8 +1548,423 @@ index cd79780..e710668 100644
  <!-- 清空重置确认对话框 -->
  <AlertDialog.Root bind:open={clearAndResetDialogOpen}>
  	<AlertDialog.Content>
+diff --git a/web/src/lib/components/video-detail-panel.svelte b/web/src/lib/components/video-detail-panel.svelte
+new file mode 100644
+index 0000000..e98d652
+--- /dev/null
++++ b/web/src/lib/components/video-detail-panel.svelte
+@@ -0,0 +1,409 @@
++<script lang="ts">
++	import { Badge } from '$lib/components/ui/badge/index.js';
++	import { Button } from '$lib/components/ui/button/index.js';
++	import { Card, CardContent } from '$lib/components/ui/card/index.js';
++	import type { PageInfo, StaffMember, VideoDetailInfo } from '$lib/types';
++	import CalendarIcon from '@lucide/svelte/icons/calendar';
++	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
++	import ClockIcon from '@lucide/svelte/icons/clock';
++	import ImageOffIcon from '@lucide/svelte/icons/image-off';
++	import MonitorIcon from '@lucide/svelte/icons/monitor';
++	import SquareArrowOutUpRightIcon from '@lucide/svelte/icons/square-arrow-out-up-right';
++	import TimerIcon from '@lucide/svelte/icons/timer';
++	import UserIcon from '@lucide/svelte/icons/user';
++	import UsersIcon from '@lucide/svelte/icons/users';
++	import XIcon from '@lucide/svelte/icons/x';
++
++	export let video: VideoDetailInfo;
++	export let pages: PageInfo[] = [];
++	export let taskNames: string[] = [];
++
++	let coverFailed = false;
++	let avatarFailed = false;
++	let introExpanded = false;
++	let lightboxOpen = false;
++
++	// 封面/头像都是 B 站 CDN 地址：CDN 认得外站 Referer 会回 403，所以图片都要带
++	// referrerpolicy="no-referrer"，顺手把 http 归一成 https。
++	$: coverUrl = (video.cover ?? '').replace(/^http:/, 'https:');
++	$: avatarUrl = (video.upper_face ?? '').replace(/^http:/, 'https:');
++
++	// ---------- 格式化 ----------
++
++	// B 站那边就把简介转义过一轮，所以库里存的是 `&amp;` 这种。这里只解一轮：
++	// `&amp;` → `&`、`&lt;` → `<`、`:&lt;` → `:<`。不递归，免得把作者自己写的
++	// `&amp;` 文案再解一次。输出一律走 Svelte 文本插值（默认转义），没有 {@html}。
++	const ENTITIES: Record<string, string> = {
++		'&amp;': '&',
++		'&lt;': '<',
++		'&gt;': '>',
++		'&quot;': '"',
++		'&#39;': "'",
++		'&apos;': "'",
++		'&nbsp;': ' '
++	};
++
++	function decodeEntitiesOnce(text: string): string {
++		return text.replace(/&(?:amp|lt|gt|quot|#39|apos|nbsp);/g, (match) => ENTITIES[match] ?? match);
++	}
++
++	/** 简介：换行与不换行空格归一、只解一轮实体；空或 `-` 当没有。 */
++	function normalizeIntro(raw: string | null | undefined): string | null {
++		if (!raw) {
++			return null;
++		}
++		const text = decodeEntitiesOnce(raw.replace(/\r\n?/g, '\n').replace(/\u00a0/g, ' ')).trim();
++		if (!text || text === '-') {
++			return null;
++		}
++		return text;
++	}
++
++	/** 联合投稿：正常是数组（后端已经解析过）；万一给的是 JSON 字符串也兜一下。 */
++	function normalizeStaff(raw: unknown): StaffMember[] {
++		let list: unknown = raw;
++		if (typeof raw === 'string') {
++			try {
++				list = JSON.parse(raw);
++			} catch {
++				return [];
++			}
++		}
++		if (!Array.isArray(list)) {
++			return [];
++		}
++		return list.filter(
++			(member): member is StaffMember =>
++				!!member && typeof member === 'object' && typeof (member as StaffMember).name === 'string'
++		);
++	}
++
++	/** 库里存的是 UTC 的 naive 时间（后端写的是 naive_utc()），没带时区后缀，补个 Z 再按本地时区显示。 */
++	function formatMoment(raw: string | null | undefined): string | null {
++		if (!raw) {
++			return null;
++		}
++		const iso = /(?:Z|[+-]\d{2}:?\d{2})$/.test(raw) ? raw : `${raw}Z`;
++		const date = new Date(iso);
++		if (Number.isNaN(date.getTime()) || date.getFullYear() < 2000) {
++			return null;
++		}
++		return date.toLocaleString('zh-CN', { hour12: false });
++	}
++
++	/** 时长：各分页加起来。 */
++	function formatDuration(seconds: number): string | null {
++		if (!seconds || seconds <= 0) {
++			return null;
++		}
++		const hours = Math.floor(seconds / 3600);
++		const minutes = Math.floor((seconds % 3600) / 60);
++		const rest = Math.floor(seconds % 60);
++		const mm = String(minutes).padStart(2, '0');
++		const ss = String(rest).padStart(2, '0');
++		return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
++	}
++
++	/** 分辨率：取第一个有宽高的分页。 */
++	function firstResolution(list: PageInfo[]): string | null {
++		for (const page of list) {
++			if (page.width && page.height) {
++				return `${page.width}×${page.height}`;
++			}
++		}
++		return null;
++	}
++
++	$: introText = normalizeIntro(video.intro);
++	$: introLong = !!introText && (introText.length > 100 || introText.split('\n').length > 4);
++	$: staffList = normalizeStaff(video.staff);
++	$: pubtimeText = formatMoment(video.pubtime);
++	$: favtimeText = formatMoment(video.favtime);
++	$: durationText = formatDuration(pages.reduce((sum, page) => sum + (page.duration ?? 0), 0));
++	$: resolutionText = firstResolution(pages);
++
++	// ---------- 状态 ----------
++
++	function getStatusText(status: number): string {
++		if (status === 7) {
++			return '已完成';
++		} else if (status === 0) {
++			return '未开始';
++		} else {
++			return `失败${status}次`;
++		}
++	}
++
++	function getSegmentColor(status: number): string {
++		if (status === 7) {
++			return 'bg-emerald-500';
++		} else if (status === 0) {
++			return 'bg-yellow-500';
++		} else {
++			return 'bg-rose-500';
++		}
++	}
++
++	function getOverallStatus(
++		downloadStatus: number[],
++		shouldDownload: boolean,
++		valid: boolean
++	): { text: string; style: string } {
++		if (!valid) {
++			return { text: '失效', style: 'bg-gray-100 text-gray-700' };
++		}
++		if (!shouldDownload) {
++			return { text: '跳过', style: 'bg-gray-100 text-gray-700' };
++		}
++		const completed = downloadStatus.filter((status) => status === 7).length;
++		const total = downloadStatus.length;
++		const failed = downloadStatus.filter((status) => status !== 7 && status !== 0).length;
++
++		if (completed === total) {
++			return { text: '完成', style: 'bg-emerald-700 text-emerald-100' };
++		} else if (failed > 0) {
++			return { text: '失败', style: 'bg-rose-700 text-rose-100' };
++		} else {
++			return { text: '等待', style: 'bg-yellow-700 text-yellow-100' };
++		}
++	}
++
++	function getTaskName(index: number): string {
++		if (taskNames.length > 0) {
++			return taskNames[index] || `任务${index + 1}`;
++		}
++		const defaultTaskNames = ['视频封面', '视频信息', 'UP主头像', 'UP主信息', '分页下载'];
++		return defaultTaskNames[index] || `任务${index + 1}`;
++	}
++
++	$: overallStatus = getOverallStatus(video.download_status, video.should_download, video.valid);
++	$: completed = video.download_status.filter((status) => status === 7).length;
++	$: total = video.download_status.length;
++
++	function handleKeydown(event: KeyboardEvent) {
++		if (event.key === 'Escape') {
++			lightboxOpen = false;
++		}
++	}
++</script>
++
++<svelte:window onkeydown={handleKeydown} />
++
++<Card class="border-border/50">
++	<CardContent class="grid gap-5 lg:grid-cols-[minmax(280px,380px)_minmax(0,1fr)_260px] lg:gap-6">
++		<!-- 左：封面。点一下看大图 -->
++		<div class="min-w-0">
++			<button
++				type="button"
++				class="bg-muted group relative block w-full cursor-zoom-in overflow-hidden rounded-lg border"
++				aria-label="查看封面大图"
++				onclick={() => (lightboxOpen = true)}
++				disabled={!coverUrl || coverFailed}
++			>
++				{#if coverFailed || !coverUrl}
++					<div class="text-muted-foreground flex aspect-video w-full items-center justify-center">
++						<ImageOffIcon class="h-8 w-8" />
++					</div>
++				{:else}
++					<img
++						src={coverUrl}
++						alt={video.name}
++						loading="lazy"
++						referrerpolicy="no-referrer"
++						class="aspect-video w-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
++						onerror={() => (coverFailed = true)}
++					/>
++				{/if}
++			</button>
++		</div>
++
++		<!-- 中：标题 / 作者 / 时间 / 简介 / 元信息 -->
++		<div class="min-w-0 space-y-3">
++			<h3 class="line-clamp-2 text-base leading-snug font-semibold" title={video.name}>
++				{video.name}
++			</h3>
++
++			<div class="flex min-w-0 flex-wrap items-center gap-2">
++				{#if avatarUrl && !avatarFailed}
++					<img
++						src={avatarUrl}
++						alt=""
++						loading="lazy"
++						referrerpolicy="no-referrer"
++						class="h-8 w-8 shrink-0 rounded-full border object-cover"
++						onerror={() => (avatarFailed = true)}
++					/>
++				{:else}
++					<div
++						class="bg-muted text-muted-foreground flex h-8 w-8 shrink-0 items-center justify-center rounded-full border"
++					>
++						<UserIcon class="h-4 w-4" />
++					</div>
++				{/if}
++				<span class="min-w-0 truncate text-sm font-medium" title={video.upper_name}>
++					{video.upper_name}
++				</span>
++				{#if video.upper_id}
++					<Button
++						size="sm"
++						variant="outline"
++						class="h-7 shrink-0 cursor-pointer px-2 text-xs"
++						onclick={() => window.open(`https://space.bilibili.com/${video.upper_id}`, '_blank')}
++					>
++						<SquareArrowOutUpRightIcon class="mr-1 h-3 w-3" />
++						打开 B 站空间
++					</Button>
++				{/if}
++			</div>
++
++			{#if pubtimeText || favtimeText}
++				<div class="text-muted-foreground flex flex-wrap gap-x-4 gap-y-1 text-xs">
++					{#if pubtimeText}
++						<span class="inline-flex items-center gap-1">
++							<CalendarIcon class="h-3.5 w-3.5 shrink-0" />
++							发布于 {pubtimeText}
++						</span>
++					{/if}
++					{#if favtimeText}
++						<span class="inline-flex items-center gap-1">
++							<ClockIcon class="h-3.5 w-3.5 shrink-0" />
++							收藏于 {favtimeText}
++						</span>
++					{/if}
++				</div>
++			{/if}
++
++			<div class="text-muted-foreground flex flex-wrap gap-x-4 gap-y-1 text-xs">
++				{#if durationText}
++					<span class="inline-flex items-center gap-1">
++						<TimerIcon class="h-3.5 w-3.5 shrink-0" />
++						时长 {durationText}
++					</span>
++				{/if}
++				{#if resolutionText}
++					<span class="inline-flex items-center gap-1">
++						<MonitorIcon class="h-3.5 w-3.5 shrink-0" />
++						分辨率 {resolutionText}
++					</span>
++				{/if}
++				<span class="font-mono">{video.bvid}</span>
++			</div>
++
++			{#if introText}
++				<div class="space-y-1">
++					<div class="text-muted-foreground text-xs font-medium">简介</div>
++					<p
++						class="text-sm leading-relaxed whitespace-pre-line {introExpanded
++							? ''
++							: 'line-clamp-4'}"
++					>
++						{introText}
++					</p>
++					{#if introLong}
++						<button
++							type="button"
++							class="text-primary inline-flex cursor-pointer items-center gap-1 text-xs hover:underline"
++							onclick={() => (introExpanded = !introExpanded)}
++						>
++							{introExpanded ? '收起' : '展开'}
++							<ChevronDownIcon
++								class="h-3 w-3 transition-transform {introExpanded ? 'rotate-180' : ''}"
++							/>
++						</button>
++					{/if}
++				</div>
++			{/if}
++
++			{#if staffList.length > 0}
++				<div class="space-y-1">
++					<div class="text-muted-foreground flex items-center gap-1 text-xs font-medium">
++						<UsersIcon class="h-3.5 w-3.5 shrink-0" />
++						联合投稿
++					</div>
++					<ul class="flex flex-wrap gap-x-3 gap-y-1 text-xs">
++						{#each staffList as member (member.mid)}
++							<li class="inline-flex min-w-0 items-center gap-1">
++								<span class="truncate" title={member.name}>{member.name}</span>
++								{#if member.title}
++									<span class="text-muted-foreground shrink-0">「{member.title}」</span>
++								{/if}
++							</li>
++						{/each}
++					</ul>
++				</div>
++			{/if}
++		</div>
++
++		<!-- 右：状态 + 进度（缩在这一栏里，不横贯） -->
++		<div class="min-w-0 space-y-4 lg:border-l lg:pl-6">
++			<div class="flex items-center justify-between gap-2">
++				<span class="text-muted-foreground text-sm">状态</span>
++				<Badge
++					variant="secondary"
++					class="shrink-0 px-2 py-1 text-xs font-medium {overallStatus.style}"
++				>
++					{overallStatus.text}
++				</Badge>
++			</div>
++
++			<div class="space-y-2">
++				<div class="text-muted-foreground flex justify-between text-xs font-medium">
++					<span>下载进度</span>
++					<span class="shrink-0">{completed}/{total}</span>
++				</div>
++				<div class="flex w-full gap-0.5">
++					{#each video.download_status as status, index (index)}
++						<div class="h-1.5 flex-1 rounded-full {getSegmentColor(status)}"></div>
++					{/each}
++				</div>
++			</div>
++
++			<ul class="space-y-1.5">
++				{#each video.download_status as status, index (index)}
++					<li class="flex items-center justify-between gap-2 text-xs">
++						<span class="text-muted-foreground min-w-0 truncate" title={getTaskName(index)}>
++							{getTaskName(index)}
++						</span>
++						<span class="flex shrink-0 items-center gap-1.5">
++							<span class="h-2 w-2 rounded-full {getSegmentColor(status)}"></span>
++							<span class="text-muted-foreground">{getStatusText(status)}</span>
++						</span>
++					</li>
++				{/each}
++			</ul>
++
++			{#if video.path}
++				<div class="text-muted-foreground min-w-0 text-xs">
++					<div class="font-medium">本地目录</div>
++					<div class="truncate font-mono" title={video.path}>{video.path}</div>
++				</div>
++			{/if}
++		</div>
++	</CardContent>
++</Card>
++
++<!-- 封面大图 -->
++{#if lightboxOpen && coverUrl && !coverFailed}
++	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
++		<button
++			type="button"
++			class="absolute inset-0 cursor-zoom-out"
++			aria-label="关闭大图"
++			onclick={() => (lightboxOpen = false)}
++		></button>
++		<img
++			src={coverUrl}
++			alt={video.name}
++			referrerpolicy="no-referrer"
++			class="relative max-h-full max-w-full rounded-lg object-contain shadow-2xl"
++		/>
++		<button
++			type="button"
++			class="absolute top-4 right-4 cursor-pointer rounded-full bg-black/60 p-2 text-white transition-colors hover:bg-black/90"
++			aria-label="关闭"
++			onclick={() => (lightboxOpen = false)}
++		>
++			<XIcon class="h-5 w-5" />
++		</button>
++	</div>
++{/if}
 diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
-index ff76d6c..2cf4e97 100644
+index ff76d6c..7b01ded 100644
 --- a/web/src/lib/types.ts
 +++ b/web/src/lib/types.ts
 @@ -34,6 +34,8 @@ export interface VideoInfo {
@@ -1507,7 +1994,50 @@ index ff76d6c..2cf4e97 100644
  	total_count: number;
  }
  
-@@ -71,6 +81,20 @@ export interface ClearAndResetVideoResponse {
+@@ -53,10 +63,41 @@ export interface PageInfo {
+ 	pid: number;
+ 	name: string;
+ 	download_status: [number, number, number, number, number];
++	/** 时长（秒） */
++	duration: number;
++	/** 分辨率 */
++	width?: number | null;
++	height?: number | null;
++}
++
++/** 联合投稿名单里的一位 */
++export interface StaffMember {
++	mid: number;
++	name: string;
++	face: string;
++	title?: string | null;
++}
++
++/**
++ * 详情页专用的视频信息：在列表用的 VideoInfo 之外，补上库里有、但列表接口不返回的元数据。
++ */
++export interface VideoDetailInfo extends VideoInfo {
++	upper_id: number;
++	/** UP 主头像（B 站 CDN 地址） */
++	upper_face: string;
++	/** 简介（B 站的 desc，纯文本，里面可能有真实换行） */
++	intro: string;
++	pubtime: string;
++	ctime: string;
++	favtime: string;
++	/** 联合投稿名单，没有就是 null；后端已经解析成数组，不是 JSON 字符串 */
++	staff?: StaffMember[] | null;
++	/** 本地目录，下过的才有内容 */
++	path: string;
+ }
+ 
+ export interface VideoResponse {
+-	video: VideoInfo;
++	video: VideoDetailInfo;
+ 	pages: PageInfo[];
+ }
+ 
+@@ -71,6 +112,20 @@ export interface ClearAndResetVideoResponse {
  	video: VideoInfo;
  }
  
@@ -1528,7 +2058,7 @@ index ff76d6c..2cf4e97 100644
  export interface ResetFilteredVideosResponse {
  	resetted: boolean;
  	resetted_videos_count: number;
-@@ -384,6 +408,15 @@ export interface DashBoardResponse {
+@@ -384,6 +439,15 @@ export interface DashBoardResponse {
  	enabled_submissions: number;
  	enable_watch_later: boolean;
  	videos_by_day: DayCountPair[];
@@ -1544,7 +2074,7 @@ index ff76d6c..2cf4e97 100644
  }
  
  export interface SysInfo {
-@@ -396,6 +429,8 @@ export interface SysInfo {
+@@ -396,6 +460,8 @@ export interface SysInfo {
  	total_disk: number;
  	used_disk: number;
  	available_disk: number;
@@ -2740,10 +3270,10 @@ index 0000000..f7565f8
 +	></iframe>
 +{/if}
 diff --git a/web/src/routes/video/[id]/+page.svelte b/web/src/routes/video/[id]/+page.svelte
-index 38e429b..12ffc3a 100644
+index 38e429b..cae740b 100644
 --- a/web/src/routes/video/[id]/+page.svelte
 +++ b/web/src/routes/video/[id]/+page.svelte
-@@ -3,10 +3,17 @@
+@@ -3,16 +3,26 @@
  	import { goto } from '$app/navigation';
  	import { onMount } from 'svelte';
  	import { Button } from '$lib/components/ui/button/index.js';
@@ -2762,12 +3292,22 @@ index 38e429b..12ffc3a 100644
  	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
  	import SquarePenIcon from '@lucide/svelte/icons/square-pen';
  	import { setBreadcrumb } from '$lib/stores/breadcrumb';
-@@ -24,15 +31,19 @@
+ 	import { appStateStore, ToQuery } from '$lib/stores/filter';
+ 	import VideoCard from '$lib/components/video-card.svelte';
++	import VideoDetailPanel from '$lib/components/video-detail-panel.svelte';
+ 	import StatusEditor from '$lib/components/status-editor.svelte';
++	import { Checkbox } from '$lib/components/ui/checkbox/index.js';
++	import { Label } from '$lib/components/ui/label/index.js';
+ 	import { toast } from 'svelte-sonner';
+ 
+ 	let videoData: VideoResponse | null = null;
+@@ -24,15 +34,20 @@
  	let clearAndResetting = false;
  	let statusEditorOpen = false;
  	let statusEditorLoading = false;
 +	let downloadDialogOpen = false;
 +	let downloading = false;
++	let forceReset = false;
  
 -	async function loadVideoDetail() {
 +	async function loadVideoDetail(silent = false) {
@@ -2784,10 +3324,64 @@ index 38e429b..12ffc3a 100644
  		error = null;
  		try {
  			const result = await api.getVideo(videoId);
-@@ -140,6 +151,67 @@
+@@ -71,9 +86,10 @@
+ 			const data = result.data;
+ 
+ 			if (data.success) {
+-				// 更新本地数据
++				// 更新本地数据。状态接口只回列表那层字段，详情多出来的元数据（简介、头像、
++				// 联合投稿等）留在本地，别被覆盖掉。
+ 				videoData = {
+-					video: data.video,
++					video: { ...videoData.video, ...data.video },
+ 					pages: data.pages
+ 				};
+ 				statusEditorOpen = false;
+@@ -98,7 +114,7 @@
+ 			const data = result.data;
+ 			if (data.resetted) {
+ 				videoData = {
+-					video: data.video,
++					video: { ...videoData.video, ...data.video },
+ 					pages: data.pages
+ 				};
+ 				toast.success('重置成功');
+@@ -121,7 +137,7 @@
+ 			const result = await api.clearAndResetVideoStatus(videoData.video.id);
+ 			const data = result.data;
+ 			videoData = {
+-				video: data.video,
++				video: { ...videoData.video, ...data.video },
+ 				pages: []
+ 			};
+ 			if (data.warning) {
+@@ -140,6 +156,90 @@
  			});
  		}
  	}
++
++	// 重置 / 清空重置的确认框：按钮上的转圈与禁用由这两个包装函数管
++	// （以前这两个对话框挂在 VideoCard 里，由它负责置位）
++	async function handleResetConfirm() {
++		resetting = true;
++		try {
++			await handleReset(forceReset);
++		} finally {
++			resetting = false;
++			resetDialogOpen = false;
++			forceReset = false;
++		}
++	}
++
++	async function handleClearAndResetConfirm() {
++		clearAndResetting = true;
++		try {
++			await handleClearAndReset();
++		} finally {
++			clearAndResetting = false;
++			clearAndResetDialogOpen = false;
++		}
++	}
 +
 +	// 立即下载：先不带覆盖试一次，库里已经有完成的一份时后端回 already_exists，这里再问一句
 +	async function handleDownloadNow() {
@@ -2852,7 +3446,7 @@ index 38e429b..12ffc3a 100644
  </script>
  
  <svelte:head>
-@@ -168,6 +240,16 @@
+@@ -168,6 +268,16 @@
  		<div class="mb-4 flex items-center justify-between">
  			<h2 class="text-xl font-semibold">视频信息</h2>
  			<div class="flex gap-2">
@@ -2869,10 +3463,111 @@ index 38e429b..12ffc3a 100644
  				<Button
  					size="sm"
  					variant="outline"
-@@ -270,6 +352,39 @@
+@@ -213,17 +323,10 @@
+ 		</div>
+ 
+ 		<div style="margin-bottom: 1rem;">
+-			<VideoCard
++			<VideoDetailPanel
+ 				video={videoData.video}
+-				mode="detail"
+-				showActions={false}
++				pages={videoData.pages}
+ 				taskNames={['视频封面', '视频信息', 'UP 主头像', 'UP 主信息', '分页下载']}
+-				bind:resetDialogOpen
+-				bind:resetting
+-				bind:clearAndResetDialogOpen
+-				bind:clearAndResetting
+-				onReset={handleReset}
+-				onClearAndReset={handleClearAndReset}
+ 			/>
+ 		</div>
+ 	</section>
+@@ -270,6 +373,120 @@
  		{/if}
  	</section>
  
++	<!-- 重置确认框 -->
++	<AlertDialog.Root bind:open={resetDialogOpen}>
++		<AlertDialog.Content>
++			<AlertDialog.Header>
++				<AlertDialog.Title>重置视频</AlertDialog.Title>
++				<AlertDialog.Description>
++					确定要重置视频 <strong>"{videoData.video.name}"</strong> 的下载状态吗？
++					<br />
++					此操作会将所有的失败状态重置为未开始，<span class="text-destructive font-medium"
++						>无法撤销</span
++					>。
++				</AlertDialog.Description>
++			</AlertDialog.Header>
++
++			<div class="space-y-4 py-4">
++				<div class="rounded-lg border border-orange-200 bg-orange-50 p-3">
++					<div class="mb-2 flex items-center space-x-2">
++						<Checkbox id="force-reset-all" bind:checked={forceReset} />
++						<Label for="force-reset-all" class="text-sm font-medium text-orange-700"
++							>⚠️ 强制重置</Label
++						>
++					</div>
++					<p class="text-xs leading-relaxed text-orange-700">
++						除重置失败状态外还会检查修复任务状态的标识位 <br />
++						版本升级引入新任务时勾选该选项进行重置，可以允许旧视频执行新任务
++					</p>
++				</div>
++			</div>
++
++			<AlertDialog.Footer>
++				<AlertDialog.Cancel
++					onclick={() => {
++						forceReset = false;
++					}}>取消</AlertDialog.Cancel
++				>
++				<AlertDialog.Action
++					onclick={handleResetConfirm}
++					disabled={resetting}
++					class={forceReset ? 'bg-orange-600 hover:bg-orange-700' : ''}
++				>
++					{resetting ? '重置中...' : forceReset ? '确认强制重置' : '确认重置'}
++				</AlertDialog.Action>
++			</AlertDialog.Footer>
++		</AlertDialog.Content>
++	</AlertDialog.Root>
++
++	<!-- 清空重置确认框 -->
++	<AlertDialog.Root bind:open={clearAndResetDialogOpen}>
++		<AlertDialog.Content>
++			<AlertDialog.Header>
++				<AlertDialog.Title>清空重置视频</AlertDialog.Title>
++				<AlertDialog.Description>
++					确定要清空重置视频 <strong>"{videoData.video.name}"</strong> 吗？
++					<br />
++					<br />
++					此操作会：
++					<ul class="mt-2 ml-4 list-disc space-y-1">
++						<li>将视频状态重置为未开始</li>
++						<li>删除所有分页信息</li>
++						<li class="text-destructive font-medium">删除视频对应的文件夹</li>
++					</ul>
++					<br />
++					该功能可在多页视频变更后手动触发全量更新，执行后<span class="text-destructive font-medium"
++						>无法撤销</span
++					>。
++				</AlertDialog.Description>
++			</AlertDialog.Header>
++
++			<AlertDialog.Footer>
++				<AlertDialog.Cancel>取消</AlertDialog.Cancel>
++				<AlertDialog.Action
++					onclick={handleClearAndResetConfirm}
++					disabled={clearAndResetting}
++					class="bg-destructive hover:bg-destructive/90"
++				>
++					{clearAndResetting ? '清空重置中...' : '确认清空重置'}
++				</AlertDialog.Action>
++			</AlertDialog.Footer>
++		</AlertDialog.Content>
++	</AlertDialog.Root>
++
 +	<!-- 立即下载：已经存在时的覆盖确认框 -->
 +	<AlertDialog.Root bind:open={downloadDialogOpen}>
 +		<AlertDialog.Content>

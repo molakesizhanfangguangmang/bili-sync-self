@@ -31,15 +31,18 @@
   行内「立即下载」按钮（点到已经存在的会弹「重新下载并覆盖」确认框），「⋯」菜单里加「状态编辑」
   （复用详情页那套 Sheet 编辑器；列表行没有分页信息，打开前多取一次 `GET /api/videos/{id}`）。
   默认视图下同一个 bvid 折成一条，卡片上多印一行 bvid + 来源数
-- `web/src/routes/video/[id]/+page.svelte`：详情页加行内「立即下载」按钮，行为与列表行一致
-  （已经存在 → 「重新下载并覆盖」确认框；已失效只提示不下载），复用 `POST /api/videos/{id}/download`
-- `web/src/lib/components/video-card.svelte`：卡片头部加封面缩略图（列表 112×63、详情 200×113），
-  取 `<video.cover>` 的 B 站 CDN 直链，挂 `referrerpolicy="no-referrer"` 并把 `http://` 归一为 `https://`
-  （实测该 CDN 认 Referer：带外站 Referer 403、不带 200），取图失败落 `ImageOff` 占位；
-  详情页复用 `VideoCard mode="detail"`，一处改动两处生效
 - `web/src/lib/api.ts`、`web/src/lib/types.ts`：加 `/dashboard-layout` 的读写方法与类型、
   `/videos/{id}/download` 的方法与类型；`SysInfo` 加 `net_rx_speed` / `net_tx_speed`；
   `DashBoardResponse` 加队列与总账几个计数；`VideoListItem`（`VideoInfo` + `source_count`）
+- `web/src/lib/components/video-detail-panel.svelte`（新增）+ `web/src/routes/video/[id]/+page.svelte`：
+  详情页的「视频信息」换成这个三段栅格组件 —— 左封面（`aspect-video` 放大，**点一下看大图**：纯 Svelte 状态 + 一层
+  `fixed inset-0` 自绘遮罩，Esc/点背景关闭，没引新依赖）｜中标题/UP 主（头像 + 名字 + 「打开 B 站空间」按钮，头像不做点击目标）/发布与收藏时间/简介
+  （默认 4 行、「展开/收起」）/时长（各分页相加）/分辨率（取首个有宽高的分页）/bvid/联合投稿（有才显示）｜右状态 Badge + `x/5` + 五段进度条
+  （缩在 260px 栏内，不再横贯）并逐行列出五个任务名。原挂在该页 `VideoCard` 上的重置/清空重置确认框跟着挪进详情页。
+  格式：简介走 `formatIntro`（`\r\n` 归一、`\xa0` 归一、**只解一轮** HTML 实体、空或 `-` 当没有、空行保留），联合投稿 `parseStaff`
+  容错解析（后端给的就是数组，兜一层 JSON 字符串的情况），输出一律走 Svelte 文本插值（默认转义，不用 `{@html}`）；标题 name 不做实体解码。
+- `web/src/lib/types.ts`：加 `VideoDetailInfo`（`VideoInfo` + 详情专属字段）与 `StaffMember`；`PageInfo` 补 `duration/width/height`；
+  `VideoResponse.video` 改成 `VideoDetailInfo`（状态类接口仍回 `VideoInfo`，详情页把两边的字段合并后再存本地状态）。
 
 后端（Rust）：
 
@@ -58,8 +61,11 @@
   等正在跑的那轮结束后按顺序下
 - `workflow.rs`：`download_single_video()` 手动单条下载（缺分页时先补一次详情）；
   `process_video_source()` / `download_unprocessed_videos()` 多带一个 `duplicated_video_ids` 过滤候选
-- `api/request.rs`、`api/response.rs`：`DownloadVideoRequest`、`VideoListItem`、`DownloadVideoResponse`；
-  `VideoInfo` 加 `cover`（`video.cover` 就是 B 站 CDN 地址，无需刮削，前端直接当 `<img src>`）
+- `api/request.rs`、`api/response.rs`：`DownloadVideoRequest`、`VideoListItem`、`DownloadVideoResponse`
+- `api/response.rs`：新增 `VideoDetailInfo`（`VideoInfo` flatten + `upper_id / upper_face / intro / pubtime / ctime / favtime / staff / path`），
+  `get_video` 改用它；`PageInfo` 补 `duration / width / height`。列表接口 `get_videos` 仍只回 `VideoInfo`。
+- `api/routes/videos/mod.rs`：`to_video_detail_info()`（从完整 `video::Model` 手工构造，跟 `to_video_info()` 并列），
+  `get_video` 取完整 Model 而不是 `into_partial_model::<VideoInfo>()`。
 
 去重只作用在**下载候选**与**列表展示**两处：不改 `data.sqlite` 表结构、不加列、无迁移，
 也不动管道/通知逻辑。折叠只在默认视图生效，切到单源筛选仍逐条显示。
@@ -117,5 +123,5 @@ docker restart bili-sync-rs
    `api/routes/` 的模块清单有没有挪窝。
 2. 改 `UPSTREAM_PIN` 与补丁，推上去，看这次构建绿不绿。
 
-补丁面仍然很小（前端两个已有文件 + 一个新增页面 + 三个 lib/Rust 文件 + 一个新路由），
+补丁面仍然很小（前端几个已有文件 + 两个新增页面/组件 + 几个 lib/Rust 文件 + 一个新路由），
 上游撞上的概率不高；真撞上了，改的是补丁，不是上游代码。

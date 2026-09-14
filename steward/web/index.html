@@ -1,0 +1,965 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bili-sync 管家</title>
+<script>
+/* 明暗：被 bili-sync 前端套进 iframe 时那边会把当前主题当 ?theme=dark|light 传过来
+   （iframe 是另一个源，读不到父页面的主题，只能这么传）；直接打开本页时按系统偏好走。
+   在 <style> 之前跑，免得先亮一下再变暗。 */
+(function () {
+	var q = new URLSearchParams(location.search);
+	var want = q.get('theme');
+	/* embed=1：被首页 iframe 套着时用，只渲染概览那几块 */
+	if (q.get('embed')) document.documentElement.dataset.embed = '1';
+	var mq = window.matchMedia('(prefers-color-scheme: dark)');
+	function apply() {
+		var dark = (want === 'dark' || want === 'light') ? want === 'dark' : mq.matches;
+		document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+	}
+	apply();
+	if (mq.addEventListener) mq.addEventListener('change', apply);
+	else if (mq.addListener) mq.addListener(apply);
+})();
+</script>
+<style>
+  :root{
+    --bg:#eef1f4; --card:rgba(255,255,255,.72); --line:#dfe3e8; --ink:#22262b;
+    --dim:#71797f; --accent:#3f6c9e; --ok:#2f6f52; --part:#8a6a1f; --bad:#9d453c; --none:#8b9196;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:24px 18px 80px; color:var(--ink); background:var(--bg);
+    font:14px/1.6 system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:17px;font-weight:600;margin:0;letter-spacing:.02em}
+  .sub{color:var(--dim);font-size:12.5px}
+  .banner{
+    display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+    margin:10px 0 0;padding:7px 12px;border:1px solid var(--line);border-radius:9px;
+    background:rgba(255,255,255,.6);color:var(--dim);font-size:12.5px;
+  }
+  .banner.warn{background:#fbeeec;border-color:#d9b3ae;color:var(--bad)}
+  nav.tabs{display:flex;gap:6px;margin:16px 0 14px}
+  nav.tabs button{
+    border:1px solid var(--line);background:transparent;color:var(--dim);
+    padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px;
+  }
+  nav.tabs button.on{background:rgba(255,255,255,.85);color:var(--ink);border-color:#cdd4db}
+  .bar{
+    display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+    background:var(--card);border:1px solid var(--line);border-radius:10px;
+    padding:10px 12px;margin-bottom:12px;
+  }
+  select,input[type=text]{
+    font:inherit;color:inherit;padding:5px 9px;border:1px solid var(--line);
+    border-radius:7px;background:rgba(255,255,255,.85);
+  }
+  input[type=text]{min-width:200px;flex:1}
+  .chips{display:flex;gap:4px}
+  .chips button{
+    border:1px solid transparent;background:transparent;color:var(--dim);
+    padding:4px 10px;border-radius:7px;cursor:pointer;font-size:12.5px;
+  }
+  .chips button.on{background:#e7ecf1;color:var(--ink);border-color:#d3dae1}
+  .chips button b{font-weight:600;color:#4c545a}
+  .grow{flex:1}
+  .help{
+    position:relative;display:inline-flex;align-items:center;justify-content:center;
+    width:17px;height:17px;border-radius:50%;border:1px solid #c9d1d9;color:var(--dim);
+    font-size:11.5px;line-height:1;cursor:help;user-select:none;flex:none;
+  }
+  .help .tip{
+    position:absolute;top:23px;left:50%;transform:translateX(-50%);z-index:9;display:none;
+    width:min(380px,88vw);padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+    background:rgba(255,255,255,.98);box-shadow:0 8px 22px rgba(20,30,40,.13);
+    color:var(--ink);font-size:12.5px;line-height:1.6;text-align:left;white-space:normal;cursor:default;
+  }
+  .help:hover .tip,.help:focus .tip{display:block}
+  .tip .t-lead{color:var(--dim);margin-bottom:6px}
+  .tip .t-row{display:flex;gap:8px;margin-top:3px}
+  .tip .t-row .k{flex:none;width:62px;color:var(--dim)}
+  .tip .t-row .k.hi{color:var(--ink)}
+  button.danger{
+    border:1px solid #d9b3ae;background:#fbeeec;color:var(--bad);
+    padding:5px 14px;border-radius:7px;cursor:pointer;font-size:13px;
+  }
+  button.danger:disabled{opacity:.45;cursor:default}
+  button.plain{
+    border:1px solid var(--line);background:rgba(255,255,255,.85);color:var(--ink);
+    padding:5px 12px;border-radius:7px;cursor:pointer;font-size:13px;
+  }
+  button.plain:disabled{opacity:.45;cursor:default}
+  .list{border:1px solid var(--line);border-radius:10px;background:var(--card);overflow:hidden}
+  .row{
+    display:flex;gap:10px;align-items:flex-start;padding:9px 12px;border-top:1px solid #eaeef2;
+  }
+  .row:first-child{border-top:0}
+  .pill{
+    flex:none;font-size:11.5px;padding:1px 8px;border-radius:99px;border:1px solid;
+    margin-top:2px;white-space:nowrap;
+  }
+  .s-exists{color:var(--ok);border-color:#bcd6c9;background:#eef6f1}
+  .s-partial{color:var(--part);border-color:#ddd0ab;background:#f8f4e8}
+  .s-missing{color:var(--bad);border-color:#ddc0bc;background:#faeeec}
+  .s-nopages{color:var(--none);border-color:#d6dade;background:#f2f4f6}
+  .s-undownloaded{color:#5a6b80;border-color:#cbd6e2;background:#eff3f8}
+  .main{flex:1;min-width:0}
+  .title{font-weight:500;word-break:break-word}
+  .meta{color:var(--dim);font-size:12px;margin-top:2px;word-break:break-all}
+  .right{flex:none;color:var(--dim);font-size:12px;text-align:right;white-space:nowrap}
+  .ghost{color:#a3a9ae;font-size:12px}
+  .tag{
+    display:inline-block;font-size:11px;padding:0 6px;border-radius:5px;
+    border:1px solid #d6dade;background:#f2f4f6;color:var(--none);margin-left:6px;
+  }
+
+  /* ---- 首页仪表盘 ---- */
+  .dashbar{display:flex;align-items:center;gap:8px;margin:16px 0 8px}
+  .dashbar .t{font-size:12.5px;color:var(--dim);letter-spacing:.04em}
+  .blkwrap{position:relative}
+  .blkmenu{
+    position:absolute;right:0;top:31px;z-index:12;min-width:158px;padding:6px;
+    border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.98);
+    box-shadow:0 8px 22px rgba(20,30,40,.13);
+  }
+  .blkmenu label{
+    display:flex;gap:8px;align-items:center;padding:4px 8px;border-radius:6px;
+    cursor:pointer;font-size:12.5px;
+  }
+  .blkmenu label:hover{background:#eef1f4}
+  .blkmenu .sp{border-top:1px solid var(--line);margin:5px 0}
+  .blkmenu button.nb{
+    width:100%;text-align:left;border:0;background:transparent;color:var(--accent);
+    cursor:pointer;font:inherit;font-size:12.5px;padding:4px 8px;border-radius:6px;
+  }
+  .blkmenu button.nb:hover{background:#eef1f4}
+  .dash{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+  .card{border:1px solid var(--line);border-radius:10px;background:var(--card);padding:10px 12px;min-width:0}
+  .card .h{font-size:12px;color:var(--dim)}
+  .card .big{
+    font-size:19px;font-weight:600;margin-top:4px;letter-spacing:.01em;
+    font-variant-numeric:tabular-nums;word-break:break-all;
+  }
+  .card .big.sm{font-size:15px}
+  .card .m{font-size:12px;color:var(--dim);margin-top:3px;word-break:break-all}
+  .card .m b{font-weight:600;color:#4c545a}
+  .card .m .hi{color:var(--ok)}
+  .card .m .lo{color:var(--bad)}
+  .dash-empty{
+    color:var(--dim);font-size:12.5px;border:1px dashed var(--line);
+    border-radius:10px;padding:14px;text-align:center;
+  }
+  .sw{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--dim)}
+  .sw input{margin:0;cursor:pointer}
+  .sw input:checked + span{color:var(--ok)}
+  .sw input:disabled + span{opacity:.5}
+  .rb{margin-top:5px;line-height:1.5}
+  .group-head{
+    display:flex;gap:10px;align-items:center;padding:8px 12px;
+    background:rgba(240,243,246,.9);border-top:1px solid #e4e9ee;
+    font-size:12.5px;color:#4c545a;
+  }
+  .group-head:first-child{border-top:0}
+  .group-head .g-name{font-weight:500;color:var(--ink)}
+  .empty{padding:22px 12px;color:var(--dim);text-align:center}
+  label.cb{display:flex;align-items:center;gap:6px;cursor:pointer;flex:none}
+  .foot{
+    position:fixed;left:0;right:0;bottom:0;border-top:1px solid var(--line);
+    background:rgba(248,250,251,.94);backdrop-filter:saturate(160%) blur(8px);
+    padding:10px 18px;display:flex;gap:10px;align-items:center;justify-content:flex-end;
+  }
+  .foot .info{margin-right:auto;color:var(--dim);font-size:12.5px}
+  .foot .grp{display:flex;gap:10px}
+  .err{color:var(--bad)}
+  [hidden]{display:none !important}
+
+  /* ---- 暗色：只覆盖颜色，不动布局。值挑的是暗底上仍看得清的那一档 ---- */
+  :root[data-theme=dark]{
+    --bg:#15181b; --card:rgba(255,255,255,.045); --line:#2e343b; --ink:#e3e6e9;
+    --dim:#98a0a8; --accent:#7fa8d4; --ok:#7fc3a0; --part:#d3b06a; --bad:#dd9b93; --none:#9aa1a8;
+  }
+  [data-theme=dark] .banner{background:rgba(255,255,255,.05)}
+  [data-theme=dark] .banner.warn{background:#30201d;border-color:#5c3b36;color:#dd9b93}
+  [data-theme=dark] nav.tabs button.on{background:rgba(255,255,255,.10);border-color:#464d55}
+  [data-theme=dark] select,[data-theme=dark] input[type=text]{background:rgba(255,255,255,.06)}
+  [data-theme=dark] .chips button.on{background:#2c3239;border-color:#464d55}
+  [data-theme=dark] .chips button b{color:#c3c9cf}
+  [data-theme=dark] .help{border-color:#4a5158}
+  [data-theme=dark] .help .tip{background:#22262b;box-shadow:0 8px 22px rgba(0,0,0,.5)}
+  [data-theme=dark] button.danger{border-color:#5c3b36;background:#30201d;color:#dd9b93}
+  [data-theme=dark] button.plain{background:rgba(255,255,255,.08)}
+  [data-theme=dark] .row{border-top-color:#2b3037}
+  [data-theme=dark] .s-exists{color:#7fc3a0;border-color:#31594385;background:#1a2a22}
+  [data-theme=dark] .s-partial{color:#d3b06a;border-color:#5c4c2285;background:#2a2416}
+  [data-theme=dark] .s-missing{color:#dd9b93;border-color:#5c3b3685;background:#2b1d1b}
+  [data-theme=dark] .s-nopages{color:#9aa1a8;border-color:#3c424a;background:#23272c}
+  [data-theme=dark] .s-undownloaded{color:#93a7c0;border-color:#3a4655;background:#1c232b}
+  [data-theme=dark] .tag{border-color:#3c424a;background:#23272c;color:#9aa1a8}
+  [data-theme=dark] .group-head{background:rgba(255,255,255,.04);border-top-color:#2b3037;color:#b9c0c7}
+  [data-theme=dark] .ghost{color:#7d848b}
+  [data-theme=dark] .foot{background:rgba(21,24,27,.94)}
+  [data-theme=dark] .blkmenu{background:#1d2126;box-shadow:0 8px 22px rgba(0,0,0,.45)}
+  [data-theme=dark] .blkmenu label:hover,[data-theme=dark] .blkmenu button.nb:hover{background:#262b30}
+  [data-theme=dark] .card .m b{color:#b9c0c7}
+  /* embed=1：首页只嵌概览块，标题 / 板块按钮 / tab / 页脚都收起来 */
+  [data-embed] body{padding:14px 14px 16px;background:transparent}
+  [data-embed] header,[data-embed] .dashbar,[data-embed] nav.tabs,
+  [data-embed] section[id^=tab-],[data-embed] .foot{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>bili-sync 管家</h1>
+    <div class="sub" id="summary">读取中…</div>
+  </header>
+
+  <div class="banner" id="banner" hidden>
+    <span id="banner-text"></span>
+    <span class="grow"></span>
+    <button class="plain" id="btn-release" hidden>恢复被停用的源</button>
+  </div>
+
+  <div class="dashbar">
+    <span class="t">概览</span>
+    <span class="grow"></span>
+    <div class="blkwrap">
+      <button class="plain" id="btn-blk">板块</button>
+      <div class="blkmenu" id="blkmenu" hidden></div>
+    </div>
+  </div>
+  <div class="dash" id="dash"></div>
+
+  <nav class="tabs">
+    <button data-tab="rec" class="on">视频清单</button>
+    <button data-tab="loc">本地文件</button>
+    <button data-tab="dl">下载列表</button>
+  </nav>
+
+  <section id="tab-rec">
+    <div class="bar">
+      <select id="f-group"></select>
+      <input type="text" id="f-q" placeholder="搜标题 / UP / BV 号 / 路径">
+      <span class="help" tabindex="0" aria-label="五档判据">?<span class="tip">
+        <div class="t-lead">判据只看这一条的分页文件（<code>page.path</code> 指向的 mp4）在不在磁盘上。多 P 视频按分页聚合。</div>
+        <div class="t-row"><span class="k hi">存在</span><span>所有分页的文件都在</span></div>
+        <div class="t-row"><span class="k">部分</span><span>有的在有的不在，或者有分页还没落盘</span></div>
+        <div class="t-row"><span class="k">不存在</span><span>下过（有落盘路径），但文件一个都没了</span></div>
+        <div class="t-row"><span class="k">未下载</span><span>有分页行，但都没有落盘路径 —— 从没下过</span></div>
+        <div class="t-row"><span class="k">无分页</span><span><code>page</code> 表里没有它的行</span></div>
+      </span></span>
+      <span class="chips" id="f-status">
+        <button data-s="" class="on">全部</button>
+        <button data-s="exists">存在</button>
+        <button data-s="partial">部分</button>
+        <button data-s="missing">不存在</button>
+        <button data-s="undownloaded">未下载</button>
+        <button data-s="nopages">无分页</button>
+      </span>
+      <span class="grow"></span>
+      <button class="plain" id="btn-rec-reload">重新扫描</button>
+    </div>
+    <div class="list" id="rec-list"><div class="empty">读取中…</div></div>
+  </section>
+
+  <section id="tab-loc" hidden>
+    <div class="bar">
+      <label class="cb"><input type="checkbox" id="sel-all"> 全选</label>
+      <select id="loc-src"></select>
+      <select id="loc-sort">
+        <option value="group">按来源分组</option>
+        <option value="time-desc">时间：新 → 旧</option>
+        <option value="time-asc">时间：旧 → 新</option>
+        <option value="size-desc">体积：大 → 小</option>
+        <option value="size-asc">体积：小 → 大</option>
+      </select>
+      <button class="plain" id="btn-reload">重新扫描文件目录</button>
+      <span class="help" tabindex="0" aria-label="这一栏的口径">?<span class="tip">
+        <div class="t-lead">这一栏的单位是<b>文件夹</b>，不是单个文件。</div>
+        <div class="t-row"><span class="k">列出</span><span><code>/downloads</code> 下每个视频文件夹：体积、文件数</span></div>
+        <div class="t-row"><span class="k">删除</span><span>整目录删掉 —— 视频、字幕、nfo、封面一起走，空目录也不留</span></div>
+        <div class="t-row"><span class="k">记录</span><span>不动 <code>data.sqlite</code>；删完回「视频清单」那条会变「不存在」</span></div>
+        <div class="t-row"><span class="k">筛选</span><span>按下载目录分组，可只看某一个来源</span></div>
+        <div class="t-row"><span class="k">排序</span><span>按来源分组，或按「文件夹里最新那个文件」的时间、或按体积，排完不再分组</span></div>
+        <div class="t-row"><span class="k">护栏</span><span>下载根目录、源目录本身及其上级一律拒删</span></div>
+      </span></span>
+      <span class="grow"></span>
+      <span class="sub" id="loc-info">读取中…</span>
+    </div>
+    <div class="list" id="loc-list"><div class="empty">读取中…</div></div>
+  </section>
+
+  <section id="tab-dl" hidden>
+    <div class="bar">
+      <label class="cb"><input type="checkbox" id="q-all"> 全选</label>
+      <span class="chips" id="q-bucket">
+        <button data-b="pending" class="on">待下载 <b>0</b></button>
+        <button data-b="done">已下载 <b>0</b></button>
+        <button data-b="off">不下 <b>0</b></button>
+      </span>
+      <input type="text" id="q-q" placeholder="搜标题 / UP / BV 号">
+      <span class="help" tabindex="0" aria-label="这一栏做什么">?<span class="tip">
+        <div class="t-lead">这一栏就是库里每条视频的两个开关：<b>要不要下</b>（<code>should_download</code>）和 <b>下完没有</b>（分页有没有落盘路径）。</div>
+        <div class="t-row"><span class="k hi">待下载</span><span>要下、但还没下完 —— bili-sync 下一轮会去下</span></div>
+        <div class="t-row"><span class="k">已下载</span><span>要下、每页都落过盘（文件后来被删了也算，看的是库里的记录）</span></div>
+        <div class="t-row"><span class="k">不下</span><span>不要把这条下下来；记录还在，随时能加回队列</span></div>
+        <div class="t-row"><span class="k">加入队列</span><span>改成「要下」，下一轮开工</span></div>
+        <div class="t-row"><span class="k">移出队列</span><span>改成「不下」，只动开关，不删记录也不删文件</span></div>
+        <div class="t-row"><span class="k">重置并重下</span><span>清掉这条的分页记录、状态归零，下一轮重新抓分页再下；盘上旧文件不动</span></div>
+        <div class="t-row"><span class="k">删除记录</span><span>把 video / page 里的记录删掉，磁盘上的文件不动</span></div>
+        <div class="t-row"><span class="k hi">清理僵尸完成</span><span>把「库里标着已完成、盘上文件却一个不剩」的条目收回完成标记、清掉落盘路径，并标成「不下」。只动库，不动文件 —— 想重下就勾「加入下载队列」再点「重置并重下」</span></div>
+      </span></span>
+      <span class="grow"></span>
+      <span class="sub" id="dl-info"></span>
+      <button class="plain" id="btn-q-purge">清理僵尸完成</button>
+      <button class="plain" id="btn-dl-reload">重新扫描</button>
+    </div>
+    <div class="list" id="dl-list"><div class="empty">读取中…</div></div>
+  </section>
+</div>
+
+<div class="foot" id="foot" hidden>
+  <span class="info" id="foot-info"></span>
+  <span class="grp" id="foot-loc" hidden>
+    <button class="plain" id="btn-clear">清空选择</button>
+    <button class="danger" id="btn-del" disabled>删除选中</button>
+  </span>
+  <span class="grp" id="foot-dl" hidden>
+    <button class="plain" id="btn-q-clear">清空选择</button>
+    <button class="plain" id="btn-q-unwant" disabled>移出下载队列</button>
+    <button class="plain" id="btn-q-want" disabled>加入下载队列</button>
+    <button class="plain" id="btn-q-redl" disabled>重置并重下</button>
+    <button class="danger" id="btn-q-del" disabled>删除记录</button>
+  </span>
+</div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const api = (p) => p + (TOKEN ? (p.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN) : '');
+const STATUS_TEXT = { exists:'存在', partial:'部分', missing:'不存在', undownloaded:'未下载', nopages:'无分页' };
+const STATUS_DESC = {
+  exists:'所有分页的文件都在',
+  partial:'有的在有的不在，或者有分页还没落盘',
+  missing:'下过（有落盘路径），但文件一个都没了',
+  undownloaded:'有分页行，但都没有落盘路径 —— 从没下过',
+  nopages:'page 表里没有它的行'
+};
+const BUCKET_TEXT = { pending:'待下载', done:'已下载', off:'不下' };
+const BUCKET_CLASS = { pending:'s-undownloaded', done:'s-exists', off:'s-nopages' };
+const BUCKET_DESC = {
+  pending:'要下、还没下完',
+  done:'要下、每页都落过盘',
+  off:'不改队列，这条不会被下'
+};
+
+function fmtSize(n){
+  if(!n) return '0 B';
+  const u=['B','KiB','MiB','GiB','TiB']; let i=0, v=n;
+  while(v>=1024 && i<u.length-1){ v/=1024; i++; }
+  return (v>=100||i===0 ? Math.round(v) : v.toFixed(1)) + ' ' + u[i];
+}
+function fmtTime(t){
+  if(!t) return '';
+  const d = new Date(t*1000), p2 = (n) => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p2(d.getMonth()+1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+const esc = (s) => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+let REC = { records: [], summary:{}, queue:{}, count:0 };
+let FILES = { groups: [], count:0, totalSize:0 };
+let DISK = {};
+let NET = { rxRate:0, txRate:0, age:-1, iface:'' };
+let fStatus = '', fGroup = '', fQuery = '';
+let qBucket = 'pending', qQuery = '';
+let fSrc = '', fSort = 'group';
+let diskTimer = null, netTimer = null;
+
+/* ---------------- 首页仪表盘 ---------------- */
+/* 板块的显隐存在服务端（steward-prefs.json，跟 data.sqlite 一个目录），
+   换浏览器/换设备进来是同一份配置。 */
+const BLOCKS = [
+  { id:'disk',   name:'磁盘' },
+  { id:'net',    name:'网速' },
+  { id:'videos', name:'视频总账' },
+  { id:'queue',  name:'下载队列' },
+  { id:'gate',   name:'闸门与源' }
+];
+let PREFS = { blocks: BLOCKS.map(b => b.id) };
+
+const fmtRate = (b) => fmtSize(b) + '/s';
+
+function cardBody(id){
+  if(id === 'disk'){
+    const d = DISK;
+    if(!d.total) return ['读不到下载卷', esc(d.root || ''), ''];
+    const warn = d.braked ? ' <span class="lo">已拉闸</span>' : '';
+    return [fmtSize(d.free) + ' 可用',
+            `剩 <b>${d.pct}%</b> · 阈值 ${d.floor}%${warn}`,
+            `共 ${fmtSize(d.total)} · ${esc(d.root || '')}`];
+  }
+  if(id === 'net'){
+    const stale = NET.age < 0 || NET.age > 10;
+    return ['<span id="net-down">↓ ' + fmtRate(NET.rxRate) + '</span>',
+            '<span id="net-up">↑ ' + fmtRate(NET.txRate) + '</span>',
+            (stale ? '<span class="lo">采样没在跑</span>' : esc(NET.iface || 'net'))
+              + ` · 累计收 ${fmtSize(NET.rx || 0)}`];
+  }
+  if(id === 'videos'){
+    const s = REC.summary || {};
+    return [`${REC.count || 0} 条`,
+            `存在 <b class="hi">${s.exists || 0}</b> · 部分 ${s.partial || 0} · 不存在 ${s.missing || 0}`,
+            `未下载 ${s.undownloaded || 0} · 无分页 ${s.nopages || 0}`];
+  }
+  if(id === 'queue'){
+    const q = REC.queue || {};
+    return [`<span class="hi">${q.pending || 0}</span> 待下载`,
+            `已下载 <b>${q.done || 0}</b> · 不下 <b>${q.off || 0}</b>`,
+            `合计 ${(q.pending || 0) + (q.done || 0) + (q.off || 0)} 条`];
+  }
+  const d = DISK, w = d.watch || {};
+  return [d.braked ? '<span class="lo">已拉闸</span>' : '正常',
+          `阈值 ${d.floor || 0}% · 核盘 ${w.onDisk || 0} 条在盘`,
+          (w.on ? '核盘线程在跑' : '核盘线程关着') + (d.pushed ? ` · 拉闸推过 ${d.pushed} 次` : '')];
+}
+
+function renderDash(){
+  const box = document.getElementById('dash');
+  const ids = BLOCKS.map(b => b.id).filter(id => PREFS.blocks.includes(id));
+  if(!ids.length){
+    box.innerHTML = '<div class="dash-empty">板块都收起来了 —— 右上角「板块」加回来</div>';
+    return;
+  }
+  box.innerHTML = ids.map(id => {
+    const body = cardBody(id);
+    const name = BLOCKS.find(b => b.id === id).name;
+    return `<div class="card" data-b="${id}">
+      <div class="h">${esc(name)}</div>
+      <div class="big">${body[0]}</div>
+      <div class="m">${body[1]}</div>
+      ${body[2] ? `<div class="m">${body[2]}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function renderBlkMenu(){
+  const box = document.getElementById('blkmenu');
+  box.innerHTML = BLOCKS.map(b =>
+    `<label><input type="checkbox" data-b="${b.id}" ${PREFS.blocks.includes(b.id) ? 'checked' : ''}>${esc(b.name)}</label>`
+  ).join('') + '<div class="sp"></div><button class="nb" data-all="1">全都要</button>';
+  box.querySelectorAll('input[data-b]').forEach(cb => cb.onchange = () => {
+    const id = cb.dataset.b;
+    if(cb.checked){ if(!PREFS.blocks.includes(id)) PREFS.blocks.push(id); }
+    else PREFS.blocks = PREFS.blocks.filter(x => x !== id);
+    renderDash();
+    savePrefs();
+  });
+  box.querySelector('button[data-all]').onclick = () => {
+    PREFS.blocks = BLOCKS.map(b => b.id);
+    renderBlkMenu();
+    renderDash();
+    savePrefs();
+  };
+}
+
+function netCardOnly(){
+  const d = document.getElementById('net-down'), u = document.getElementById('net-up');
+  if(!d || !u) return;                    /* 网速板块被收起来了就不动 */
+  d.textContent = '↓ ' + fmtRate(NET.rxRate);
+  u.textContent = '↑ ' + fmtRate(NET.txRate);
+}
+
+/* ---------------- tab 切换 ---------------- */
+document.querySelectorAll('nav.tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav.tabs button').forEach(x => x.classList.toggle('on', x === b));
+  const t = b.dataset.tab;
+  document.getElementById('tab-rec').hidden = t !== 'rec';
+  document.getElementById('tab-loc').hidden = t !== 'loc';
+  document.getElementById('tab-dl').hidden = t !== 'dl';
+  document.getElementById('foot').hidden = t === 'rec';
+  document.getElementById('foot-loc').hidden = t !== 'loc';
+  document.getElementById('foot-dl').hidden = t !== 'dl';
+  syncSel();
+});
+
+/* ---------------- A：视频清单 ---------------- */
+function renderRecords(){
+  const box = document.getElementById('rec-list');
+  const q = fQuery.trim().toLowerCase();
+  const rows = REC.records.filter(r =>
+    (!fStatus || r.status === fStatus) &&
+    (!fGroup || r.groupKey === fGroup) &&
+    (!q || (r.name + ' ' + r.upper + ' ' + r.bvid + ' ' + r.folder).toLowerCase().includes(q))
+  );
+  if(!rows.length){ box.innerHTML = '<div class="empty">没有匹配的记录</div>'; return; }
+  box.innerHTML = rows.map(r => `
+    <div class="row">
+      <span class="pill s-${r.status}" title="${esc(STATUS_DESC[r.status] || '')}">${STATUS_TEXT[r.status] || r.status}</span>
+      <div class="main">
+        <div class="title">${titleHTML(r)}</div>
+        <div class="meta">${esc(r.group)} · ${esc(r.upper)} · ${esc(r.bvid)} · 分页 ${r.present}/${r.pages}${r.withPath < r.pages ? '（' + (r.pages - r.withPath) + ' 页未落盘）' : ''}${r.size ? ' · ' + fmtSize(r.size) : ''}</div>
+        <div class="meta ghost">${esc(r.folder)}</div>
+      </div>
+      <div class="right">
+        <label class="sw" title="要下 = 写回 video.should_download=1；不下只是不再下，盘上的文件不动">
+          <input type="checkbox" class="want" data-id="${r.id}" ${r.want ? 'checked' : ''}>
+          <span>${r.want ? '要下' : '不下'}</span>
+        </label>
+        <div class="rb">${r.status === 'nopages' ? '无分页行'
+            : r.status === 'undownloaded' ? '还没下过'
+            : r.present === 0 ? '文件没了'
+            : r.present === r.pages ? '文件齐'
+            : '缺 ' + (r.pages - r.present) + ' 个'}</div>
+      </div>
+    </div>`).join('');
+  box.querySelectorAll('input.want').forEach(cb => cb.onchange = onWant);
+}
+
+function titleHTML(r){
+  return esc(r.name) + (r.want ? '' : '<span class="tag" title="在下载列表里被标成不下">不下</span>');
+}
+
+/* 行内开关：跟下载列表底部的「加入/移出下载队列」是同一个接口、同一件事，
+   区别只是这里一次一条。改完就地更新（不整表重绘，免得滚动位置跳走）。 */
+async function onWant(ev){
+  const cb = ev.target;
+  const id = Number(cb.dataset.id);
+  const want = cb.checked;
+  cb.disabled = true;
+  try{
+    const res = await (await fetch(api('/api/queue'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action: want ? 'want' : 'unwant', ids: [id] })
+    })).json();
+    if(!res.ok) throw new Error(res.error || '没改成');
+    const r = REC.records.find(x => x.id === id);
+    if(r){
+      const before = r.bucket;
+      r.want = want;
+      r.bucket = want ? (r.pages > 0 && r.withPath >= r.pages ? 'done' : 'pending') : 'off';
+      if(REC.queue && before !== r.bucket){
+        REC.queue[before] = Math.max(0, (REC.queue[before] || 0) - 1);
+        REC.queue[r.bucket] = (REC.queue[r.bucket] || 0) + 1;
+      }
+      const row = cb.closest('.row');
+      if(row){
+        cb.parentElement.querySelector('span').textContent = want ? '要下' : '不下';
+        const t = row.querySelector('.title');
+        if(t) t.innerHTML = titleHTML(r);
+      }
+      renderDash();
+      syncSel();
+    }
+  }catch(e){
+    cb.checked = !want;
+    alert('改不动：' + e.message);
+  }
+  cb.disabled = false;
+}
+
+function fillGroupSelect(){
+  const sel = document.getElementById('f-group');
+  const seen = new Map();
+  REC.records.forEach(r => { if(!seen.has(r.groupKey)) seen.set(r.groupKey, { label:r.group, n:0 }); seen.get(r.groupKey).n++; });
+  const opts = ['<option value="">全部来源</option>'].concat(
+    [...seen.entries()].map(([k,v]) => `<option value="${esc(k)}">${esc(v.label)}（${v.n}）</option>`));
+  sel.innerHTML = opts.join('');
+  sel.value = fGroup;
+}
+
+/* ---------------- C：下载列表 ---------------- */
+function renderQueue(){
+  const box = document.getElementById('dl-list');
+  const q = qQuery.trim().toLowerCase();
+  const rows = REC.records.filter(r =>
+    r.bucket === qBucket &&
+    (!q || (r.name + ' ' + r.upper + ' ' + r.bvid).toLowerCase().includes(q))
+  );
+  if(!rows.length){ box.innerHTML = '<div class="empty">这一档是空的</div>'; syncSel(); return; }
+  box.innerHTML = rows.map(r => `
+    <div class="row">
+      <label class="cb"><input type="checkbox" class="dpick" value="${r.id}"></label>
+      <span class="pill ${BUCKET_CLASS[r.bucket]}" title="${esc(BUCKET_DESC[r.bucket] || '')}">${BUCKET_TEXT[r.bucket] || r.bucket}</span>
+      <div class="main">
+        <div class="title">${esc(r.name)}</div>
+        <div class="meta">${esc(r.group)} · ${esc(r.upper)} · ${esc(r.bvid)} · 分页 ${r.present}/${r.pages} 在盘${r.size ? ' · ' + fmtSize(r.size) : ''}</div>
+      </div>
+      <div class="right">${r.bucket === 'done' ? '下过'
+          : r.bucket === 'off' ? '不下'
+          : r.pages === 0 ? '待抓分页'
+          : '还有 ' + (r.pages - r.withPath) + ' 页没下'}</div>
+    </div>`).join('');
+  box.querySelectorAll('.dpick').forEach(cb => cb.onchange = syncSel);
+  syncSel();
+}
+
+function pickedQ(){
+  return [...document.querySelectorAll('#dl-list .dpick:checked')].map(c => Number(c.value));
+}
+
+function syncSel(){
+  const qsel = pickedQ();
+  const qall = document.querySelectorAll('#dl-list .dpick');
+  const lsel = picked();
+  const lall = document.querySelectorAll('#loc-list .pick');
+
+  document.getElementById('foot-info').textContent =
+    document.getElementById('tab-dl').hidden
+      ? (lsel.length ? `已选 ${lsel.length} 项 · ${fmtSize(selSize(lsel))}` : '未选')
+      : (qsel.length ? `已选 ${qsel.length} 条` : '未选');
+
+  const qa = document.getElementById('q-all');
+  if(qa) qa.checked = qall.length > 0 && qsel.length === qall.length;
+  ['btn-q-unwant','btn-q-want','btn-q-redl','btn-q-del'].forEach(id =>
+    document.getElementById(id).disabled = qsel.length === 0);
+
+  document.getElementById('sel-all').checked = lall.length > 0 && lsel.length === lall.length;
+  document.getElementById('btn-del').disabled = lsel.length === 0;
+  const litems = fileItems();
+  document.getElementById('loc-info').textContent =
+    fSrc
+      ? `${litems.length} / ${FILES.count} 个文件夹 · 共 ${fmtSize(litems.reduce((a,r) => a + r.it.size, 0))}`
+      : `${FILES.count} 个视频文件夹 · 共 ${fmtSize(FILES.totalSize)}`;
+
+  const q = REC.queue || {};
+  document.getElementById('dl-info').textContent =
+    `待下载 ${q.pending||0} · 已下载 ${q.done||0} · 不下 ${q.off||0}`;
+  document.querySelectorAll('#q-bucket button').forEach(b => {
+    const n = (REC.queue || {})[b.dataset.b] || 0;
+    b.querySelector('b').textContent = n;
+  });
+}
+
+async function queueAction(action){
+  const ids = pickedQ();
+  if(!ids.length) return;
+  const label = { want:'加入下载队列', unwant:'移出下载队列', delete:'删除记录', redownload:'重置并重下' }[action];
+  const extra = {
+    want: '改成「要下」，bili-sync 下一轮就会去下它们。',
+    unwant: '改成「不下」，只动开关：记录留着、文件不动，随时能加回来。',
+    delete: '把 video / page 记录删掉。磁盘上的文件不动 —— 要清盘去「本地文件」栏。',
+    redownload: '清掉分页记录、状态归零，下一轮重新抓分页再下。盘上已有的旧文件不会被删。'
+  }[action];
+  if(!confirm(`${label}：${ids.length} 条？\n\n${extra}`)) return;
+  try{
+    const res = await (await fetch(api('/api/queue'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action, ids })
+    })).json();
+    if(!res.ok) alert('失败：' + (res.error || ''));
+    await loadRecords();
+  }catch(e){ alert('请求失败：' + e); }
+}
+
+/* ---------------- B：本地文件 ---------------- */
+const SORTS = {
+  group:       () => 0,
+  'time-desc': (a,b) => b.mtime - a.mtime,
+  'time-asc':  (a,b) => a.mtime - b.mtime,
+  'size-desc': (a,b) => b.size - a.size,
+  'size-asc':  (a,b) => a.size - b.size
+};
+const SORT_NAME = { group:'按来源分组', 'time-desc':'时间：新 → 旧', 'time-asc':'时间：旧 → 新',
+                    'size-desc':'体积：大 → 小', 'size-asc':'体积：小 → 大' };
+
+/* 根目录那批（rel 里没有 /）没法用空串当值，给个哨兵 */
+const gkey = (g) => g || '\u0001root';
+
+/* 当前筛选下还剩哪些条目 */
+function fileItems(){
+  const out = [];
+  FILES.groups.forEach((g, gi) => {
+    if(fSrc && gkey(g.group) !== fSrc) return;
+    g.items.forEach(it => out.push({ it, gi }));
+  });
+  return out;
+}
+
+function fileRow(it, gi){
+  return `<div class="row">
+        <label class="cb"><input type="checkbox" class="pick" value="${esc(it.abs)}" data-g="${gi}"></label>
+        <div class="main">
+          <div class="title">${esc(it.abs.split('/').pop())}</div>
+          <div class="meta ghost">${esc(it.rel)} · 最后修改 ${fmtTime(it.mtime)}</div>
+        </div>
+        <div class="right">${fmtSize(it.size)}<br><span class="ghost">${it.files} 个文件</span></div>
+      </div>`;
+}
+
+function renderFiles(){
+  const box = document.getElementById('loc-list');
+  if(!FILES.groups.length){ box.innerHTML = '<div class="empty">下载目录里没扫到视频文件夹</div>'; syncSel(); return; }
+  const rows = fileItems();
+  if(!rows.length){ box.innerHTML = '<div class="empty">这个来源底下没有文件夹</div>'; syncSel(); return; }
+
+  if(fSort === 'group'){
+    let html = '';
+    FILES.groups.forEach((g, gi) => {
+      if(fSrc && gkey(g.group) !== fSrc) return;
+      const sum = g.items.reduce((a,b) => a + b.size, 0);
+      html += `<div class="group-head">
+          <label class="cb"><input type="checkbox" class="g-all" data-g="${gi}"></label>
+          <span class="g-name">${esc(g.group || '(根目录)')}</span>
+          <span>${g.items.length} 项 · ${fmtSize(sum)}</span>
+        </div>` + g.items.map(it => fileRow(it, gi)).join('');
+    });
+    box.innerHTML = html;
+  }else{
+    const items = rows.map(r => r.it).sort(SORTS[fSort]);
+    box.innerHTML = `<div class="group-head">
+          <label class="cb"><input type="checkbox" class="g-all" data-g="all"></label>
+          <span class="g-name">${SORT_NAME[fSort]}</span>
+          <span>${items.length} 项 · ${fmtSize(items.reduce((a,b) => a + b.size, 0))}</span>
+        </div>` + items.map(it => fileRow(it, '-')).join('');
+  }
+
+  box.querySelectorAll('.g-all').forEach(cb => cb.onchange = () => {
+    const sel = cb.dataset.g === 'all' ? '.pick' : `.pick[data-g="${cb.dataset.g}"]`;
+    box.querySelectorAll(sel).forEach(p => p.checked = cb.checked);
+    syncSel();
+  });
+  box.querySelectorAll('.pick').forEach(cb => cb.onchange = syncSel);
+  syncSel();
+}
+
+function fillLocSrc(){
+  const sel = document.getElementById('loc-src');
+  sel.innerHTML = [`<option value="">全部来源（${FILES.count}）</option>`].concat(
+    FILES.groups.map(g => `<option value="${esc(gkey(g.group))}">${esc(g.group || '(根目录)')}（${g.items.length}）</option>`)
+  ).join('');
+  sel.value = fSrc;
+  if(sel.value !== fSrc){ fSrc = ''; sel.value = ''; }   // 这个来源已经没了就回到全部
+}
+
+function picked(){
+  return [...document.querySelectorAll('#loc-list .pick:checked')].map(c => c.value);
+}
+
+function selSize(paths){
+  const set = new Set(paths);
+  let n = 0;
+  for(const g of FILES.groups) for(const it of g.items) if(set.has(it.abs)) n += it.size;
+  return n;
+}
+
+async function doDelete(){
+  const paths = picked();
+  if(!paths.length) return;
+  if(!confirm(`删除 ${paths.length} 个文件夹（${fmtSize(selSize(paths))}）？\n\n文件夹里的视频、字幕、nfo 会一起删掉，不能撤销。\n记录会留在 bili-sync 里，那边会显示「不存在」。`)) return;
+  const btn = document.getElementById('btn-del');
+  btn.disabled = true; btn.textContent = '删除中…';
+  try{
+    const res = await (await fetch(api('/api/delete'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ paths })
+    })).json();
+    if(res.failedCount) alert(`删了 ${res.deletedCount} 个，失败 ${res.failedCount} 个：\n` +
+      res.failed.map(f => f.path + ' — ' + f.error).join('\n'));
+    await loadFiles();
+    await loadRecords();
+  }catch(e){ alert('删除请求失败：' + e); }
+  btn.textContent = '删除选中';
+  syncSel();
+}
+
+/* ---------------- 数据加载 ---------------- */
+async function loadRecords(){
+  const box = document.getElementById('rec-list');
+  try{
+    const res = await (await fetch(api('/api/records'))).json();
+    if(!res.ok){ box.innerHTML = `<div class="empty err">${esc(res.error || '读取失败')}</div>`; return; }
+    REC = res;
+    fillGroupSelect();
+    renderRecords();
+    renderQueue();
+    const s = res.summary;
+    document.getElementById('summary').textContent =
+      `${res.count} 条记录 · 存在 ${s.exists} / 部分 ${s.partial} / 不存在 ${s.missing}` +
+      (s.undownloaded ? ` / 未下载 ${s.undownloaded}` : '') +
+      (s.nopages ? ` / 无分页 ${s.nopages}` : '');
+    renderDash();
+  }catch(e){
+    box.innerHTML = `<div class="empty err">读取失败：${esc(e)}</div>`;
+  }
+}
+
+async function loadNet(){
+  try{
+    const d = await (await fetch(api('/api/net'))).json();
+    if(!d.ok) return;
+    NET = d;
+    netCardOnly();
+  }catch(e){ /* 读不到就留着上一次的数 */ }
+}
+
+async function loadPrefs(){
+  try{
+    const d = await (await fetch(api('/api/prefs'))).json();
+    const known = BLOCKS.map(b => b.id);
+    if(d.ok && d.prefs && Array.isArray(d.prefs.blocks))
+      PREFS.blocks = d.prefs.blocks.filter(id => known.includes(id));
+  }catch(e){ /* 拿不到就用默认：全都摆上 */ }
+  renderBlkMenu();
+  renderDash();
+}
+
+async function savePrefs(){
+  try{
+    const res = await (await fetch(api('/api/prefs'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ blocks: PREFS.blocks })
+    })).json();
+    if(!res.ok) alert('板块配置没存上：' + (res.error || ''));
+  }catch(e){ alert('板块配置没存上：' + e.message); }
+}
+
+async function loadFiles(){
+  const box = document.getElementById('loc-list');
+  box.innerHTML = '<div class="empty">扫描中…</div>';
+  try{
+    const res = await (await fetch(api('/api/files'))).json();
+    if(!res.ok){ box.innerHTML = `<div class="empty err">${esc(res.error || '扫描失败')}</div>`; return; }
+    FILES = res;
+    fillLocSrc();
+    renderFiles();
+  }catch(e){
+    box.innerHTML = `<div class="empty err">扫描失败：${esc(e)}</div>`;
+  }
+}
+
+async function loadDisk(){
+  const el = document.getElementById('banner');
+  try{
+    const d = await (await fetch(api('/api/disk'))).json();
+    if(!d.ok) return;
+    DISK = d;
+    let txt = d.total
+      ? `下载卷 ${d.root} 剩余 ${fmtSize(d.free)}（${d.pct}%）`
+      : `读不到下载卷 ${d.root}`;
+    if(d.floor > 0) txt += ` · 阈值 ${d.floor}%`;
+    if(d.braked) txt = `已拉闸：${d.note || '源被停用了'} —— ` + txt;
+    document.getElementById('banner-text').textContent = txt;
+    el.hidden = false;
+    el.classList.toggle('warn', !!d.braked);
+    document.getElementById('btn-release').hidden = !d.braked;
+    renderDash();
+  }catch(e){ /* 盘读不到就不显示横幅 */ }
+}
+
+/* ---------------- 事件 ---------------- */
+document.getElementById('btn-blk').onclick = (e) => {
+  e.stopPropagation();
+  const m = document.getElementById('blkmenu');
+  m.hidden = !m.hidden;
+};
+document.getElementById('blkmenu').onclick = (e) => e.stopPropagation();
+document.addEventListener('click', () => { document.getElementById('blkmenu').hidden = true; });
+document.getElementById('f-q').oninput = e => { fQuery = e.target.value; renderRecords(); };
+document.getElementById('f-group').onchange = e => { fGroup = e.target.value; renderRecords(); };
+document.getElementById('loc-src').onchange = e => { fSrc = e.target.value; renderFiles(); };
+document.getElementById('loc-sort').onchange = e => { fSort = e.target.value; renderFiles(); };
+document.getElementById('q-q').oninput = e => { qQuery = e.target.value; renderQueue(); };
+document.querySelectorAll('#f-status button').forEach(b => {
+  b.title = b.dataset.s ? STATUS_DESC[b.dataset.s] : '不过滤';
+});
+document.getElementById('f-status').onclick = e => {
+  const b = e.target.closest('button'); if(!b) return;
+  fStatus = b.dataset.s;
+  document.querySelectorAll('#f-status button').forEach(x => x.classList.toggle('on', x === b));
+  renderRecords();
+};
+document.getElementById('q-bucket').onclick = e => {
+  const b = e.target.closest('button'); if(!b) return;
+  qBucket = b.dataset.b;
+  document.querySelectorAll('#q-bucket button').forEach(x => x.classList.toggle('on', x === b));
+  renderQueue();
+};
+document.getElementById('sel-all').onchange = e => {
+  document.querySelectorAll('#loc-list .pick').forEach(c => c.checked = e.target.checked);
+  document.querySelectorAll('.g-all').forEach(c => c.checked = e.target.checked);
+  syncSel();
+};
+document.getElementById('q-all').onchange = e => {
+  document.querySelectorAll('#dl-list .dpick').forEach(c => c.checked = e.target.checked);
+  syncSel();
+};
+document.getElementById('btn-clear').onclick = () => {
+  document.querySelectorAll('#loc-list input').forEach(c => c.checked = false);
+  syncSel();
+};
+document.getElementById('btn-q-clear').onclick = () => {
+  document.querySelectorAll('#dl-list .dpick').forEach(c => c.checked = false);
+  syncSel();
+};
+document.getElementById('btn-del').onclick = doDelete;
+document.getElementById('btn-reload').onclick = loadFiles;
+document.getElementById('btn-dl-reload').onclick = async () => {
+  const b = document.getElementById('btn-dl-reload');
+  b.disabled = true; b.textContent = '扫描中…';
+  await loadRecords();
+  b.disabled = false; b.textContent = '重新扫描';
+};
+document.getElementById('btn-rec-reload').onclick = async () => {
+  const b = document.getElementById('btn-rec-reload');
+  b.disabled = true; b.textContent = '扫描中…';
+  await loadRecords();
+  b.disabled = false; b.textContent = '重新扫描';
+};
+document.getElementById('btn-q-want').onclick = () => queueAction('want');
+document.getElementById('btn-q-unwant').onclick = () => queueAction('unwant');
+document.getElementById('btn-q-redl').onclick = () => queueAction('redownload');
+document.getElementById('btn-q-del').onclick = () => queueAction('delete');
+document.getElementById('btn-q-purge').onclick = async () => {
+  const b = document.getElementById('btn-q-purge');
+  if(!confirm('清理「僵尸完成标记」？\n\n把库里标着已完成、落盘路径也在、但文件一个都不在盘上的条目：\n收回完成标记、清掉落盘路径，并标成「不下」。\n\n只动库，不动文件。盘上没东西可删。\n想重下就勾「加入下载队列」再点「重置并重下」。')) return;
+  b.disabled = true; b.textContent = '清理中…';
+  try{
+    const r = await (await fetch(api('/api/purge'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action:'stale' })
+    })).json();
+    if(!r.ok) alert('失败：' + (r.error || ''));
+    else alert(`清理完成：${r.stale} 条收回完成标记、${r.pages} 个分页清掉落盘路径，都改成「不下」。\n\n盘上文件没动。`);
+    await loadRecords();
+  }catch(e){ alert('请求失败：' + e); }
+  b.textContent = '清理僵尸完成'; b.disabled = false; syncSel();
+};
+document.getElementById('btn-release').onclick = async () => {
+  const b = document.getElementById('btn-release');
+  b.disabled = true;
+  try{
+    const res = await (await fetch(api('/api/brake'), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action:'release' })
+    })).json();
+    if(!res.ok) alert('失败：' + (res.error || ''));
+    else alert(res.note || '已恢复');
+    await loadDisk();
+    await loadRecords();
+  }catch(e){ alert('请求失败：' + e); }
+  b.disabled = false;
+};
+
+loadPrefs();
+loadRecords();
+loadFiles();
+loadDisk();
+loadNet();
+diskTimer = setInterval(loadDisk, 60000);
+netTimer = setInterval(loadNet, 2000);
+
+/* embed=1：把高度报给父页面，那边照着撑 iframe 的框（块可增删、数字会变行） */
+function reportHeight(){
+  if(!document.documentElement.dataset.embed) return;
+  try{ parent.postMessage({ height: document.documentElement.scrollHeight }, '*'); }catch(e){}
+}
+if(document.documentElement.dataset.embed){
+  window.addEventListener('resize', reportHeight);
+  setInterval(reportHeight, 700);
+}
+</script>
+</body>
+</html>

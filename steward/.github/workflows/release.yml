@@ -1,0 +1,143 @@
+# 两个架构各编一份，打 tag 时自动发 release。
+#
+#   push tag v*    -> 编译 + 发 release（附件：裸二进制 ×2、完整包 ×2、SHA256SUMS）
+#   workflow_dispatch -> 只编译，不发 release，产物在 Actions 的 artifact 里
+#
+# aarch64 用 GitHub 的 arm64 runner（公开仓免费）。若该 runner 不可用，改成
+#   - runner: ubuntu-latest
+#     arch: aarch64
+# 并在「编译」那步加 CC=aarch64-linux-gnu-gcc、前面补 apt-get install gcc-aarch64-linux-gnu。
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取版本号
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 编译
+        run: ./build.sh
+
+      - name: 冒烟
+        run: |
+          ./dist/steward --help > /dev/null
+          file dist/steward
+
+      - name: 命名并打包
+        run: |
+          V='${{ steps.ver.outputs.version }}'
+          NAME="steward-v$V-${{ matrix.arch }}"
+
+          cp dist/steward "$NAME"
+
+          mkdir -p "pkg/$NAME/dist"
+          cp install.sh run.sh stop.sh uninstall.sh "pkg/$NAME/"
+          cp dist/steward "pkg/$NAME/dist/steward"
+          chmod 755 "pkg/$NAME"/*.sh "pkg/$NAME/dist/steward"
+          tar -C pkg -czf "$NAME.tar.gz" "$NAME"
+
+          ls -l "$NAME" "$NAME.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: steward-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            steward-v*-${{ matrix.arch }}
+            steward-v*-${{ matrix.arch }}.tar.gz
+
+  release:
+    name: release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 核对 install.sh 里的 VERSION 与 tag 一致
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          WANT=$(sed -n 's/^VERSION=${VERSION:-\([^}]*\)}$/\1/p' install.sh | head -1)
+          echo "tag=$V  install.sh 的 VERSION=$WANT"
+          test "$V" = "$WANT" || {
+            echo "install.sh 的 VERSION 没跟上 tag，先同步再发。" >&2
+            exit 1
+          }
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: 生成 SHA256SUMS
+        run: |
+          cd out
+          sha256sum steward-v* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 建 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          cat > notes.md <<EOF
+          steward ${V}。
+
+          静态单文件，无运行时依赖。附件按架构各两份：
+
+          - \`steward-v${V}-aarch64\` / \`steward-v${V}-x86_64\`：裸二进制，放进 \`dist/steward\` 即可。
+          - \`steward-v${V}-aarch64.tar.gz\` / \`steward-v${V}-x86_64.tar.gz\`：完整包，内含 \`install.sh\`、\`run.sh\`、\`stop.sh\`、\`uninstall.sh\` 与 \`dist/steward\`。
+
+          用哪个架取决于 bili-sync 容器所在的机器，不是宿主以外的机器。
+
+          装法二选一：
+
+          \`\`\`sh
+          # 从仓库装（脚本自己取对应架构的二进制）
+          git clone https://github.com/molakesizhanfangguangmang/bili-sync-steward.git
+          cd bili-sync-steward && ./install.sh
+
+          # 从本页装
+          tar xzf steward-v${V}-x86_64.tar.gz
+          cd steward-v${V}-x86_64 && ./install.sh
+          \`\`\`
+
+          附件校验：
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS --ignore-missing
+          \`\`\`
+
+          详细说明见仓库 README。
+          EOF
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --title "steward v$V" \
+            --notes-file notes.md

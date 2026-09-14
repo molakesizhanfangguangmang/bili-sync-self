@@ -73,11 +73,12 @@
 
 构建脚本（只为对外构建，跑起来跟上游没区别）：
 
-- `crates/bili_sync/build.rs`：上游这里靠 `built` 抓工作区 `.git` 写进 `built.rs`，而 `version()`
-  优先用 `GIT_VERSION`。在那个脚手架仓里编时，工作区的 `.git` 是脚手架自己的，抓出来的是它的 commit，
-  对外没意义。补丁加了：仓根若有 `SELF_VERSION`，就把 `built.rs` 里的 `GIT_VERSION` 换成它的内容、
-  `GIT_DIRTY` 置 `false`；**没有这个文件就完全保持上游行为**（比如你把补丁直接打到上游树上编）。
-  覆盖没命中会 assert 失败，不会静默编出一个假版本号。
+- `crates/bili_sync/build.rs` + `src/config/args.rs`：上游这里靠 `built` 抓工作区 `.git` 写进
+  `built.rs`，而 `version()` 优先用 `GIT_VERSION` —— 在这个脚手架仓里编时，工作区的 `.git` 是脚手架
+  自己的，抓出来的是它的 commit，对外没意义。补丁改成：build.rs 另写一个 `self_version.rs`
+  （内容取自仓根的 `SELF_VERSION`），`version()` 先看它，没有再走上游那套。这样不用去猜
+  built crate 生成的常量长什么样（第一版就是在猜，CI 上 assert 直接挂了）。
+  **没有 `SELF_VERSION` 文件就完全保持上游行为**（比如把补丁直接打到上游树上编）。
 
 去重只作用在**下载候选**与**列表展示**两处：不改 `data.sqlite` 表结构、不加列、无迁移，
 也不动管道/通知逻辑。折叠只在默认视图生效，切到单源筛选仍逐条显示。

@@ -1,3 +1,54 @@
+diff --git a/crates/bili_sync/build.rs b/crates/bili_sync/build.rs
+index 5881cba..6ca9a59 100644
+--- a/crates/bili_sync/build.rs
++++ b/crates/bili_sync/build.rs
+@@ -1,4 +1,46 @@
+ fn main() {
+     println!("cargo::rerun-if-changed=../../web/build");
+     built::write_built_file().expect("Failed to acquire build-time information");
++
++    // 上游这里靠 built 抓工作区的 git 信息写进 built.rs，version() 会优先用它。
++    // 这份二进制是在「脚手架仓」里编的，工作区的 .git 属于脚手架自己，抓出来的
++    // commit 对外没有意义。所以仓根放一个 SELF_VERSION，有就用它的内容覆盖掉；
++    // 没有这个文件（比如你直接把补丁打到上游树上编）就完全保持上游行为。
++    let Ok(version) = std::fs::read_to_string(
++        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SELF_VERSION"),
++    ) else {
++        return;
++    };
++    let version = version.trim();
++    if version.is_empty() {
++        return;
++    }
++
++    let path = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("built.rs");
++    let source = std::fs::read_to_string(&path).expect("读不到 built.rs");
++
++    let mut hit_version = false;
++    let mut hit_dirty = false;
++    let patched: String = source
++        .lines()
++        .map(|line| {
++            if line.starts_with("pub const GIT_VERSION") {
++                hit_version = true;
++                format!("pub const GIT_VERSION: Option<&str> = Some(\"{version}\");")
++            } else if line.starts_with("pub const GIT_DIRTY") {
++                hit_dirty = true;
++                "pub const GIT_DIRTY: Option<bool> = Some(false);".to_string()
++            } else {
++                line.to_string()
++            }
++        })
++        .collect::<Vec<_>>()
++        .join("\n");
++
++    assert!(
++        hit_version && hit_dirty,
++        "built.rs 里没有 GIT_VERSION / GIT_DIRTY，覆盖失败"
++    );
++    std::fs::write(&path, patched).expect("写不回 built.rs");
++    println!("cargo:warning=bili-sync-self: version = {version}");
+ }
 diff --git a/crates/bili_sync/src/api/request.rs b/crates/bili_sync/src/api/request.rs
 index fca8ba2..a07b6af 100644
 --- a/crates/bili_sync/src/api/request.rs

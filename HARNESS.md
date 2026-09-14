@@ -12,6 +12,7 @@
 | --- | --- |
 | `.github/workflows/self-build.yaml` | 全部流程：拉上游 → 打补丁 → bun 编前端 → cross 编 aarch64/x86_64 → 打包上传 |
 | `bili-sync-self.patch` | 对上游 `c900777` 的改动（见下表） |
+| `SELF_VERSION` | 编进二进制的版本号（当前 `c900777-self-r9`），见下面「产物」 |
 | `README.md` | 用法 |
 | `LICENSE` | 上游 MIT 许可证全文 |
 | `HARNESS.md` | 本文件（改动明细与复现方式） |
@@ -70,12 +71,20 @@
 - `api/routes/videos/mod.rs`：`to_video_detail_info()`（从完整 `video::Model` 手工构造，跟 `to_video_info()` 并列），
   `get_video` 取完整 Model 而不是 `into_partial_model::<VideoInfo>()`。
 
+构建脚本（只为对外构建，跑起来跟上游没区别）：
+
+- `crates/bili_sync/build.rs`：上游这里靠 `built` 抓工作区 `.git` 写进 `built.rs`，而 `version()`
+  优先用 `GIT_VERSION`。在那个脚手架仓里编时，工作区的 `.git` 是脚手架自己的，抓出来的是它的 commit，
+  对外没意义。补丁加了：仓根若有 `SELF_VERSION`，就把 `built.rs` 里的 `GIT_VERSION` 换成它的内容、
+  `GIT_DIRTY` 置 `false`；**没有这个文件就完全保持上游行为**（比如你把补丁直接打到上游树上编）。
+  覆盖没命中会 assert 失败，不会静默编出一个假版本号。
+
 去重只作用在**下载候选**与**列表展示**两处：不改 `data.sqlite` 表结构、不加列、无迁移，
 也不动管道/通知逻辑。折叠只在默认视图生效，切到单源筛选仍逐条显示。
 
 ## 为什么不是真 fork
 
-上游整段历史要进这个私有仓只能本地全量 clone 再推，而本机到 GitHub 的链路实测会超时；
+上游整段历史要进这个仓只能本地全量 clone 再推，而本机到 GitHub 的链路实测会超时；
 GitHub 服务器侧导入的老接口（`PUT /repos/{owner}/{repo}/import`）已经下线（返回 404，
 官方指到网页版 importer）。runner 上拉上游是秒级的，没必要过本机。
 
@@ -92,6 +101,11 @@ GitHub 服务器侧导入的老接口（`PUT /repos/{owner}/{repo}/import`）已
 
 Release 里存的是解出来的**裸二进制**（`bili-sync-rs-aarch64-c900777-rN` / `bili-sync-rs-x86_64-c900777-rN`），
 外加 `SHA256SUMS` 与 `UPSTREAM-License`。
+
+版本号：仓里 `SELF_VERSION` 的内容（现在 `c900777-self-r9`）会被编进二进制，启动日志与 `--version`
+显示的就是它。改轮次时同步改这个文件，否则和 release 里的二进制名对不上。
+
+x86_64 那格在 CI 里多跑一步 `--version`，输出对不上就直接失败 —— 免得发出去的二进制连启动都不过。
 
 ## 改前端时在本机先验一遍
 

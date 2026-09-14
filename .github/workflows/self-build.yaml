@@ -77,6 +77,11 @@ jobs:
           args: "--locked --release"
           strip: true
 
+      - name: 验版本号（x86_64 在 runner 上就能直接跑）
+        if: matrix.slug == 'x86_64'
+        shell: bash
+        run: ./target/x86_64-unknown-linux-musl/release/bili-sync-rs --version
+
       - name: 打包
         shell: bash
         run: |

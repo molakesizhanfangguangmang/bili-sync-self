@@ -1,0 +1,143 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: https://github.com/amtoaer/bili-sync.git
+  UPSTREAM_PIN: c900777e78796653fdfb00421879b6a802d1eedd
+
+jobs:
+  build-bili-sync:
+    name: build bili-sync (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: 拉上游、打补丁
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q "$UPSTREAM" /tmp/upstream
+          cd /tmp/upstream
+          git checkout -q "$UPSTREAM_PIN"
+          git apply -v "$GITHUB_WORKSPACE/bili-sync-self.patch"
+          tar -c --exclude=.git --exclude=.github . | tar -x -C "$GITHUB_WORKSPACE"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: 编前端
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+      - name: 读工具链版本
+        id: rust
+        shell: bash
+        run: echo "value=$(sed -n 's/^channel = *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - name: 编译
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          toolchain: ${{ steps.rust.outputs.value }}
+          args: "--locked --release"
+          strip: true
+      - name: 冒烟
+        if: matrix.arch == 'x86_64'
+        run: ./target/x86_64-unknown-linux-musl/release/bili-sync-rs --version
+      - name: 整理产物
+        shell: bash
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/bili-sync-rs out/bili-sync-rs-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bili-sync-${{ matrix.arch }}
+          path: out/bili-sync-rs-${{ matrix.arch }}
+
+  build-steward:
+    name: build steward (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            cc: gcc
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            cc: gcc
+    steps:
+      - uses: actions/checkout@v4
+      - name: 编译
+        working-directory: steward
+        env:
+          CC: ${{ matrix.cc }}
+        run: ./build.sh
+      - name: 冒烟
+        working-directory: steward
+        run: ./dist/steward --help > /dev/null && file dist/steward
+      - name: 整理产物
+        run: cp steward/dist/steward steward-v${GITHUB_REF_NAME#v}-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: steward-${{ matrix.arch }}
+          path: steward-v*-${{ matrix.arch }}
+
+  release:
+    name: release
+    needs: [build-bili-sync, build-steward]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: 打完整包
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          test "$(tr -d '\n' < SELF_VERSION)" = "$V" || { echo 'SELF_VERSION 与 tag 不一致' >&2; exit 1; }
+          test "$(sed -n 's/^VERSION=${VERSION:-\([^}]*\)}$/\1/p' install.sh | head -1)" = "$V" || { echo 'install.sh VERSION 与 tag 不一致' >&2; exit 1; }
+          mkdir -p release
+          for arch in aarch64 x86_64; do
+            PKG="bili-sync-self-v$V-$arch"
+            mkdir -p "pkg/$PKG/dist"
+            cp "out/bili-sync-rs-$arch" "release/bili-sync-rs-$arch"
+            cp "out/steward-v$V-$arch" "release/steward-v$V-$arch"
+            cp "out/bili-sync-rs-$arch" "pkg/$PKG/dist/bili-sync-rs"
+            cp "out/steward-v$V-$arch" "pkg/$PKG/dist/steward"
+            cp install.sh run.sh stop.sh uninstall.sh "pkg/$PKG/"
+            chmod 755 "pkg/$PKG"/*.sh "pkg/$PKG/dist"/*
+            tar -C pkg -czf "release/$PKG.tar.gz" "$PKG"
+          done
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: 建 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "bili-sync-self v$V" \
+            --notes "bili-sync 主程序与 steward 管家的一体化发布。两个服务运行在同一个 bili-sync Docker 容器中。\n\n每个架构有裸二进制和完整包：完整包内含两个二进制及 install.sh/run.sh/stop.sh/uninstall.sh。按容器所在机器选择 aarch64 或 x86_64。\n\n安装：解压对应架构的完整包后执行 ./install.sh。它会同时更新 /app/bili-sync-rs 和 /app/.config/bili-sync/steward。"

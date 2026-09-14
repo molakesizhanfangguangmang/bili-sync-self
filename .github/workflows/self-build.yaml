@@ -2,9 +2,9 @@ name: Self Build
 
 # 这个仓不是上游的 fork，是个十几 KB 的「编译脚手架」：
 # 每次跑的时候把上游 pin 住的提交拉到 runner 上，打好 bili-sync-self.patch，
-# 再编出 aarch64-unknown-linux-musl 的 bili-sync-rs。
+# 再编出 aarch64 / x86_64（都是 musl 静态，无动态依赖）的 bili-sync-rs。
 #
-# 为什么不直接把上游整段历史搬进这个私有仓：GitHub 的服务器侧导入接口已经下线
+# 为什么不直接把上游整段历史搬进这个仓：GitHub 的服务器侧导入接口已经下线
 # （PUT /repos/{owner}/{repo}/import 返回 404），只剩本地全量 clone 推一条路，
 # 而这条链路在本机实测会超时。上游在 runner 上是秒拉的，何必过本机。
 #
@@ -23,8 +23,16 @@ env:
 
 jobs:
   build:
-    name: Build bili-sync-rs (aarch64-musl)
+    name: Build bili-sync-rs (${{ matrix.slug }}-musl)
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: aarch64
+            target: aarch64-unknown-linux-musl
+          - slug: x86_64
+            target: x86_64-unknown-linux-musl
     steps:
       - name: Checkout 脚手架
         uses: actions/checkout@v6
@@ -64,7 +72,7 @@ jobs:
         uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
-          target: aarch64-unknown-linux-musl
+          target: ${{ matrix.target }}
           toolchain: ${{ steps.read_rust_toolchain.outputs.value }}
           args: "--locked --release"
           strip: true
@@ -73,20 +81,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd target/aarch64-unknown-linux-musl/release
-          tar czf "$GITHUB_WORKSPACE/bili-sync-rs-Linux-aarch64-musl.tar.gz" bili-sync-rs
-          sha256sum bili-sync-rs | tee "$GITHUB_WORKSPACE/bili-sync-rs.sha256"
-          ls -l "$GITHUB_WORKSPACE/bili-sync-rs-Linux-aarch64-musl.tar.gz"
+          cd target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/bili-sync-rs-Linux-${{ matrix.slug }}-musl.tar.gz" bili-sync-rs
+          sha256sum bili-sync-rs | tee "$GITHUB_WORKSPACE/bili-sync-rs-${{ matrix.slug }}.sha256"
+          ls -l "$GITHUB_WORKSPACE/bili-sync-rs-Linux-${{ matrix.slug }}-musl.tar.gz"
 
       - name: 传产物
         uses: actions/upload-artifact@v6
         with:
-          name: bili-sync-rs-Linux-aarch64
+          name: bili-sync-rs-Linux-${{ matrix.slug }}
           path: |
-            bili-sync-rs-Linux-aarch64-musl.tar.gz
-            bili-sync-rs.sha256
+            bili-sync-rs-Linux-${{ matrix.slug }}-musl.tar.gz
+            bili-sync-rs-${{ matrix.slug }}.sha256
 
       - name: 顺带留一份前端产物（便于离线核对菜单项与路由）
+        if: matrix.slug == 'aarch64'
         uses: actions/upload-artifact@v6
         with:
           name: web-build

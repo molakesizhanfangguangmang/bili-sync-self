@@ -1,17 +1,20 @@
 # bili-sync-self
 
 不是上游的 fork，是一个十几 KB 的**编译脚手架**：把上游 pin 住的提交拉到 runner 上，打好
-`bili-sync-self.patch`，编出 aarch64（musl 静态）的 `bili-sync-rs`。
+`bili-sync-self.patch`，编出 aarch64 / x86_64（都是 musl 静态）的 `bili-sync-rs`。
 
-私有仓。给自己用的，不发布。
+补丁与二进制衍生自 [`amtoaer/bili-sync`](https://github.com/amtoaer/bili-sync)（MIT），
+与上游作者没有隶属关系，属非官方构建，无任何担保。许可证全文见 `LICENSE`。
 
 ## 里面有什么
 
 | 文件 | 作用 |
 | --- | --- |
-| `.github/workflows/self-build.yaml` | 全部流程：拉上游 → 打补丁 → bun 编前端 → cross 编 aarch64 → 打包上传 |
+| `.github/workflows/self-build.yaml` | 全部流程：拉上游 → 打补丁 → bun 编前端 → cross 编 aarch64/x86_64 → 打包上传 |
 | `bili-sync-self.patch` | 对上游 `c900777` 的改动（见下表） |
-| `HARNESS.md` | 本文件 |
+| `README.md` | 用法 |
+| `LICENSE` | 上游 MIT 许可证全文 |
+| `HARNESS.md` | 本文件（改动明细与复现方式） |
 
 上游基线：`amtoaer/bili-sync` @ `c900777e78796653fdfb00421879b6a802d1eedd`（`UPSTREAM_PIN`）。
 
@@ -81,8 +84,14 @@ GitHub 服务器侧导入的老接口（`PUT /repos/{owner}/{repo}/import`）已
 
 ## 产物
 
-- `bili-sync-rs-Linux-aarch64-musl.tar.gz` + `bili-sync-rs.sha256`（artifact 名 `bili-sync-rs-Linux-aarch64`）
-- `web-build`（前端产物，便于离线核对菜单项/路由/板块有没有进去）
+矩阵两格，各出一份：
+
+- `bili-sync-rs-Linux-aarch64-musl.tar.gz` + `bili-sync-rs-aarch64.sha256`（artifact 名 `bili-sync-rs-Linux-aarch64`）
+- `bili-sync-rs-Linux-x86_64-musl.tar.gz` + `bili-sync-rs-x86_64.sha256`（artifact 名 `bili-sync-rs-Linux-x86_64`）
+- `web-build`（前端产物，只跟着 aarch64 那格传，便于离线核对菜单项/路由/板块有没有进去）
+
+Release 里存的是解出来的**裸二进制**（`bili-sync-rs-aarch64-c900777-rN` / `bili-sync-rs-x86_64-c900777-rN`），
+外加 `SHA256SUMS` 与 `UPSTREAM-License`。
 
 ## 改前端时在本机先验一遍
 
@@ -99,7 +108,7 @@ npx svelte-check                 # 类型与 a11y 警告
 注意本机 npm 解析的是语义化版本，跟 CI 的 `bun install --frozen-lockfile` 不保证逐字一致，
 只用来提前挡语法/类型错误。
 
-## 换到机器上（要动容器，得先点头）
+## 换到机器上（要动容器）
 
 那台机器现在走**自建镜像**：`官方 v2.11.1 + 补丁二进制 + /app/start.sh（启动时拉起 steward）`，
 打 `bili-sync-self:rN`，再把 compose 的 `image:` 指过去 `docker compose up -d`。配方见机器上
